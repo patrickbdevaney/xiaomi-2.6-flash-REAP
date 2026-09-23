@@ -16,6 +16,23 @@ say() { echo "[$(date -Is)] $*" | tee -a "$LOG"; }
 
 say "REAP run start: $TOTAL tokens, seq_len $SEQ, free $(df -h / | awk 'NR==2{print $4}')"
 
+# MEMORY PRE-FLIGHT. The first launch of this run was OOM-killed 7 minutes in, at a cgroup peak
+# of 7.0 GiB on a 122 GiB box -- because ~115 GiB was already held by the nvmap driver pool,
+# which appears in NO process's RSS, in Cached, or in Slab. The kernel OOM killer scores by RSS,
+# so it selected us. `echo 3 > drop_caches` returned the box to 119 GiB instantly; `echo 1`,
+# which is all the memguard did at the time, reclaimed nothing. So: reclaim with the full
+# shrinker, then REFUSE TO START if the box is still short. Starting a 34-hour run into a
+# poisoned allocator only buys another 7-minute failure, and the corpus stage is not resumable.
+MIN_AVAIL_MB=${MIN_AVAIL_MB:-90000}
+sync; sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || say "WARN: drop_caches unavailable"
+AVAIL=$(awk '/MemAvailable:/{print int($2/1024)}' /proc/meminfo)
+say "pre-flight MemAvailable ${AVAIL}MB (floor ${MIN_AVAIL_MB}MB)"
+if [ "$AVAIL" -lt "$MIN_AVAIL_MB" ]; then
+  say "ABORT: only ${AVAIL}MB available after reclaim -- something live holds the box."
+  say "  check: ps -eo pid,rss,cmd --sort=-rss | head; systemctl --user list-units --state=running"
+  exit 1
+fi
+
 if [ ! -f artifacts/chunks/manifest.json ]; then
   say "STAGE 1 build corpus"
   "$PY" scripts/build_corpus.py --out artifacts/chunks --total-tokens "$TOTAL" \
