@@ -1,5 +1,9 @@
 # Model weights and pass outputs never belong in git.
 artifacts/saliency/
+# `artifacts/*.pt` did NOT match artifacts/chunks/*.pt -- a leading-directory glob does not
+# recurse -- so `git add -A` committed 26 corpus chunks (1.6 GB each) into history before this
+# was noticed. Ignore the whole tree; nothing under artifacts/ belongs in git.
+artifacts/
 artifacts/*.pt
 logs/
 .venv/

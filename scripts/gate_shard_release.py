@@ -68,8 +68,19 @@ if __name__ == "__main__":
         print()
         print(f"  unreclaimable WITHOUT release : {res['A']:,} MB")
         print(f"  unreclaimable WITH release    : {res['B']:,} MB")
-        ok = res["B"] < res["A"] - 2000
-        print("\n" + ("GATE PASS: releasing the handles returns the cache "
-                      f"({res['A'] - res['B']:,} MB recovered)" if ok else
-                      f"GATE FAIL: release changed nothing (A={res['A']} B={res['B']})"))
+        # WHAT THIS GATE IS NOW FOR. It was written to test the hypothesis that unreleased
+        # safetensors mmaps caused the image-bucket OOM -- pages faulted through a live mapping
+        # are unreclaimable, so the story fit. The measurement REFUTED it: releasing is worth
+        # roughly 1 GiB, not the ~100 GiB that was disappearing. The real cause was the vision
+        # tower's dense [1, H, L, L] sink_bias (see research/OOM_CONTAINMENT.md).
+        #
+        # The release is still correct and still free, so this stays as a REGRESSION record of
+        # its true value rather than an assertion of a value it never had. Demanding 2 GiB here
+        # would be asserting the refuted hypothesis.
+        delta = res["A"] - res["B"]
+        ok = res["B"] <= res["A"] + 500          # release must never make things worse
+        print(f"\n  release is worth {delta:,} MB (measured; NOT the OOM cause)")
+        print("\n" + (f"GATE PASS: releasing handles does not regress ({delta:,} MB better)"
+                      if ok else
+                      f"GATE FAIL: release made pinning WORSE (A={res['A']} B={res['B']})"))
         sys.exit(0 if ok else 1)

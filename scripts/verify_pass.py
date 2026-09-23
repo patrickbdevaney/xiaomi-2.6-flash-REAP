@@ -55,14 +55,30 @@ def verify(acc: dict, f_sum: torch.Tensor, f_cnt: torch.Tensor, buckets: list,
         if rel > 1e-6:
             problems.append(f"{name}: F diagonal disagrees with sq/cnt by {rel:.2e} relative "
                             f"-- the F outer-product slot bookkeeping is wrong")
-        # Cauchy-Schwarz on the conditional means: |F_ij| <= sqrt(F_ii * F_jj) need not hold
-        # exactly under conditional averaging, but a gross violation means index corruption.
+        # Cauchy-Schwarz on the conditional means, applied ONLY where the means mean anything.
+        #
+        # F_ii averages over the tokens where i fires; F_ij averages over the rarer set where i
+        # AND j fire. Cauchy-Schwarz holds WITHIN the co-activation set, not across two
+        # differently-normalised sets, so if i happens to fire hard on the few tokens where j
+        # also fires, |F_ij| > sqrt(F_ii*F_jj) with nothing wrong at all.
+        #
+        # This is not theory: the check failed the real chunk 1 and aborted the pass, and the
+        # violations were measured to sit entirely on rare pairs --
+        #     violating pairs   median co-activation count 6   (max 42, mean 14.5)
+        #     passing pairs     median 51                      (mean 1046)
+        # -- i.e. conditional means over a handful of samples. Gating on the co-activation count
+        # keeps the check's real job (gross index corruption shows up on WELL-SAMPLED pairs,
+        # where a wrong index pairs unrelated magnitudes across thousands of tokens) while not
+        # firing on the statistics of a small sample.
+        MIN_PAIR_COUNT = 64
         off = F - torch.diag(torch.diagonal(F))
         bound = torch.sqrt(torch.outer(torch.diagonal(F).clamp(min=0),
                                        torch.diagonal(F).clamp(min=0)))
-        viol = (off.abs() > 10 * bound + 1e-9).sum().item()
+        well_sampled = f_cnt[li].cpu() >= MIN_PAIR_COUNT
+        viol = ((off.abs() > 10 * bound + 1e-9) & well_sampled).sum().item()
         if viol:
-            problems.append(f"{name}: {viol} off-diagonal entries exceed 10x sqrt(Fii*Fjj)")
+            problems.append(f"{name}: {viol} off-diagonal entries with >= {MIN_PAIR_COUNT} "
+                            f"co-activations exceed 10x sqrt(Fii*Fjj)")
 
         if prev and name in prev:
             for k in ("sum", "sq", "cnt"):

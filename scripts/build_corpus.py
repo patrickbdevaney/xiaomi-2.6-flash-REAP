@@ -214,6 +214,18 @@ def robust_rows(hid, cfgn, split, retries: int = SOURCE_RETRIES):
                 yield row
             return
         except Exception as e:                      # noqa: BLE001 - any stream fault
+            # PERMANENT vs TRANSIENT. Retrying a wrong split name, a missing dataset or a gated
+            # repo cannot succeed -- it just burns the backoff (75 s for four attempts) to learn
+            # what the first attempt already said. Observed live:
+            # `G4KMU/t2-ragbench:ConvFinQA ... Bad split: train. Available splits: ['turn_0']`
+            # retried four times. Only genuine stream faults deserve the retry.
+            msg = f"{type(e).__name__}: {e}"
+            if any(k in msg for k in ("Bad split", "DatasetNotFoundError", "is a gated dataset",
+                                      "doesn't exist on the Hub", "Config name is missing",
+                                      "BuilderConfig", "FileNotFoundError")):
+                print(f"    ! {hid}:{cfgn or '-'} PERMANENT ({msg[:110]}); not retrying",
+                      flush=True)
+                return
             wait = min(60, 5 * 2 ** attempt)
             print(f"    ! {hid}:{cfgn or '-'} failed after {n:,} rows "
                   f"({type(e).__name__}: {str(e)[:120]}); retry {attempt+1}/{retries} in {wait}s",
@@ -345,6 +357,7 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
             print(f"  {bucket:11} SKIPPED (checkpointed)", flush=True)
             continue
         got = 0
+        _last_report = 0
         P = Packer(E, seq_len, eos, worker=MW)
 
         def emit(force=False):
@@ -357,6 +370,16 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
             ids, valid, me, tokid = r
             W.add(ids, valid, bucket, media_embeds=me, media_token_id=tokid)
             got += int(valid.sum())
+            # WITHIN-BUCKET PROGRESS. Without this a bucket is silent for its whole duration and
+            # "slow" is indistinguishable from "wedged" -- during the image bucket the process
+            # sat at 97% GPU with zero I/O for minutes, which was one long tower batch but read
+            # exactly like a hang. Cheap to print, and it is the only signal that says the run
+            # is alive between chunk writes.
+            nonlocal _last_report
+            if got - _last_report >= 250_000:
+                _last_report = got
+                print(f"    {bucket:11} {got:>11,} / {want[bucket]:,} "
+                      f"({got/max(1,want[bucket]):.0%})", flush=True)
 
         if bucket in ("image", "audio", "video"):
             src_list = {"image": SPEC.IMAGE_SOURCES, "audio": SPEC.AUDIO_SOURCES,
@@ -433,10 +456,20 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
                                               # downgraded to text -- see the module docstring
                         emit()
         else:
-            for (entry, sub) in source_targets(SPEC.SOURCES[bucket], want[bucket]):
+            plan = source_targets(SPEC.SOURCES[bucket], want[bucket])
+            for si, (entry, sub) in enumerate(plan):
                 hid, cfgn, split, text_fn = entry[0], entry[1], entry[2], entry[4]
                 if got >= want[bucket]:
                     break
+                # REDISTRIBUTE THE SHORTFALL. A source that is dead, gated or simply shallower
+                # than its share used to cost the bucket its whole allocation: the loop moved on
+                # with the next source capped at ITS OWN share, so the deficit was never made up.
+                # That is how `science` finished at 85% -- not because the corpus is thin, but
+                # because nothing reclaimed the missing weight. Re-spreading the remaining need
+                # over the sources still to come lets a live source cover for a dead one.
+                remaining = [e for e, _ in plan[si:]]
+                wsum = sum(e[3] for e in remaining) or 1.0
+                sub = max(sub, int((want[bucket] - got) * entry[3] / wsum))
                 stop_at = min(want[bucket], got + sub)
                 rows = robust_rows(hid, cfgn, split)
                 if limit_per_source:
