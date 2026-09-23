@@ -165,8 +165,15 @@ def run(src, chunks_dir, out_dir, device="cuda", dtype=torch.bfloat16,
         done.add(cf.name)
         _dump_acc(out_dir)
         state_path.write_text(json.dumps({"done": sorted(done)}, indent=1))
+        # EXPERT COVERAGE is the number that says whether the corpus is big enough. An expert
+        # never routed to has zero saliency and zero F mass, so REAP and HOPE both prune it
+        # ARBITRARILY rather than on evidence -- and with 256 experts and top-8 routing, a short
+        # corpus leaves most of them dark. This is reported every chunk so a thin corpus is
+        # visible early instead of at the end of a 34-hour pass.
+        cov = [float((v["cnt"].sum(0) > 0).float().mean()) for v in MS.ACC.values()]
         print(f"chunk {cf.name}: {len(states)} batches x {n_layers} layers "
-              f"in {time.time()-t0:.0f}s", flush=True)
+              f"in {time.time()-t0:.0f}s | expert coverage "
+              f"min {min(cov):.1%} mean {sum(cov)/len(cov):.1%}", flush=True)
         del states; gc.collect()
     return len(done)
 

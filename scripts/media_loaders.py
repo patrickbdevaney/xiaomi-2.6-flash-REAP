@@ -39,6 +39,10 @@ AUDIO_N_MELS = 128
 AUDIO_N_FFT = 960
 AUDIO_HOP = 240
 AUDIO_WINDOW = 960
+# Clip lengths from mimo_corpus_spec.CLIP_SECONDS, mirrored here so the loaders do not import
+# the spec (the spec imports the corpus, and the loaders must stay usable on their own).
+CLIP_SECONDS_AUDIO = 30
+CLIP_FRAMES_VIDEO = 10
 
 # MEASURED 2026-09-23 on REAL SPEECH, not chosen. gate_media_loaders streams a clip from
 # gpt-omni/VoiceAssistant-400K -- the actual audio calibration source -- and runs all four

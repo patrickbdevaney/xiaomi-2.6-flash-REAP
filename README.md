@@ -59,6 +59,7 @@ scripts/pull_mimo.sh           detached 177.8 GB checkpoint pull, with verificat
 scripts/calib_pass.py          layer-sequential sweep; one layer resident, resumable
 scripts/chunk_builder.py       towers + embedding table -> bucketed chunks of inputs_embeds
 scripts/media_loaders.py       audio (log-mel -> RVQ -> patch encoder) and video loaders
+scripts/build_corpus.py        streams the licence-verified sources -> bucketed chunks
 scripts/mimo_shards.py         streaming reader; MXFP4 + FP8-block dequant
 scripts/gate_*.py              gates — the first four need no GPU; run them first
 ```
@@ -88,6 +89,7 @@ F-matrix silently deflated every entry under a valid-mask until `F[k,k] == sq/cn
 - [x] Chunk builder: embedding table + towers, with the text-only-media-bucket guard
 - [x] Audio and video loaders, gated end-to-end on the real towers and the shipped RVQ tokenizer
 - [x] Ballast share decided: **0.15 → 0.20**, out of science (0.10→0.07) and finance (0.06→0.04)
+- [x] Corpus wired into the chunk builder; full chain smoked (9 buckets → chunks → pass)
 - [ ] Calibration pass → HOPE QP → per-layer budget search → Router KD
 - [ ] CUDA server (48 layers, 9 full + 39 SWA, GQA with per-type KV head counts, no shared expert)
 
