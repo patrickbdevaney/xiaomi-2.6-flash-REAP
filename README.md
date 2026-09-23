@@ -81,7 +81,7 @@ F-matrix silently deflated every entry under a valid-mask until `F[k,k] == sq/cn
 - [x] Saliency patcher, gated bit-identical against the upstream forward
 - [x] Omni corpus split specified
 - [ ] Calibration-pass driver (bucketed batching, audio/video through the processor)
-- [ ] Ballast share decided — **must be settled before the pass**; re-masking recovers only +0.028
+- [x] Ballast share decided: **0.15 → 0.20**, out of science (0.10→0.07) and finance (0.06→0.04)
 - [ ] Calibration pass → HOPE QP → per-layer budget search → Router KD
 - [ ] CUDA server (48 layers, 9 full + 39 SWA, GQA with per-type KV head counts, no shared expert)
 

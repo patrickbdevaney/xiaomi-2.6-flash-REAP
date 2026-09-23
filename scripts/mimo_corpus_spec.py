@@ -33,7 +33,9 @@ WHAT IS AND IS NOT DECIDED HERE
 DECIDED: the split exists, and it is fed with real media. That is forced by the architecture and
 needs no measurement.
 
-NOT DECIDED: the SIZE of each slice. The 0.12 multimodal share is held CONSTANT and divided,
+DECIDED 2026-09-23: ballast 0.15 -> 0.20 out of science and finance (see TOKEN_TARGET).
+
+NOT DECIDED: the size of each MULTIMODAL slice. The 0.12 multimodal share is held CONSTANT and divided,
 rather than grown at the expense of code/agentic, because there is no MiMo measurement yet to
 justify taking tokens from the primary use case. Pass 3 on GLM set its ratios from measured
 pass-2 accumulators rather than from intuition; the same discipline applies. After the MiMo
@@ -62,21 +64,53 @@ from __future__ import annotations
 from corpus_spec import (SOURCES, MM_SOURCES, TOTAL_SAMPLES, MAX_TOKENS,
                          HELDOUT_FRACTION, DIFFICULTY_TARGET, EXCLUDED)
 
-# Text targets carried over from corpus_spec pass 3; `multimodal` is replaced by its three parts.
+# Text targets carried over from corpus_spec pass 3, with ONE deliberate revision (ballast) and
+# the multimodal bucket replaced by its three parts.
+#
+# BALLAST 0.15 -> 0.20, taken from science (0.10 -> 0.07) and finance (0.06 -> 0.04).
+#
+# This revises a pass-3 number that was itself evidence-driven, so the reasoning is recorded
+# rather than asserted. Three things point the same way:
+#
+#   (1) OUR OWN MEASUREMENT. The shipped GLM mask retains only 48.7% of general saliency mass
+#       against 71-75% everywhere else, and by_domain dNLL is 1.0027 for ballast against 0.057
+#       for code and 0.024 for math. General knowledge was, by a wide margin, the worst-damaged
+#       capability of the last REAP -- and pass 3's move from 4.8% to 15% has never been
+#       validated at 50% on a second model.
+#   (2) THE COST GROWS WITH SPARSITY. arXiv 2606.03328 measures balanced multi-source
+#       calibration beating the strongest single source by +4.6 points at 30% sparsity but
+#       +18.8 at 60%. We are at 50%, where the penalty for under-representing a capability is
+#       near its worst.
+#   (3) IT CANNOT BE FIXED LATER. A bucket-balanced re-mask of the pass-2 accumulators recovered
+#       just +0.028: "re-masking cannot create information the corpus never collected." Unlike
+#       the criterion choice -- which is re-derivable offline from the accumulators for free --
+#       this number is spent the moment the pass starts.
+#
+# WHERE IT COMES FROM, AND THE HONEST COST. Science and finance, not code or agentic. They are
+# the furthest from the daily-driver use case, and a coding agent that has forgotten how the
+# world works is a worse failure than one slightly weaker at chemistry. But this IS a real cost
+# on two of the domains the corpus was built to protect, and it is a judgement call, not a
+# measurement: nobody has measured the science/finance elasticity at 50% on this model. If the
+# pass-1 by_domain readout shows science or finance damaged worse than ballast was, this is the
+# first number to move back.
+#
+# Code-adjacent (agentic + code + math) is untouched at 0.57 of tokens.
 TOKEN_TARGET = {
     "agentic":    0.23,
     "code":       0.19,
     "math":       0.15,
-    "ballast":    0.15,
+    "ballast":    0.20,      # was 0.15 on GLM pass 3; see above
     "image":      0.06,      # was the whole 0.12 `multimodal` bucket on GLM
     "audio":      0.03,
     "video":      0.03,
-    "science":    0.10,
-    "finance":    0.06,
+    "science":    0.07,      # was 0.10
+    "finance":    0.04,      # was 0.06
 }
 assert abs(sum(TOKEN_TARGET.values()) - 1.0) < 1e-9
 assert abs(TOKEN_TARGET["image"] + TOKEN_TARGET["audio"] + TOKEN_TARGET["video"] - 0.12) < 1e-9, \
     "the multimodal share is held constant and split; growing it needs a MiMo measurement"
+assert abs(TOKEN_TARGET["agentic"] + TOKEN_TARGET["code"] + TOKEN_TARGET["math"] - 0.57) < 1e-9, \
+    "code-adjacent share is the primary use case and must not be spent on ballast"
 
 # Clip lengths, chosen from the token arithmetic above so a sample is a few thousand tokens
 # rather than one video eating a whole sample's budget.
