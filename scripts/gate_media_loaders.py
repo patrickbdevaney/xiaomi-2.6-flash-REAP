@@ -75,14 +75,38 @@ try:
     ds = load_dataset("gpt-omni/VoiceAssistant-400K", split="train", streaming=True)
     row = next(iter(ds))
     for k, v in row.items():
-        if isinstance(v, dict) and "array" in v:
+        # With torchcodec installed, `datasets` hands back an AudioDecoder rather than the
+        # old {"array", "sampling_rate"} dict. Accept both: the dict form is what older
+        # installs return, and silently taking neither is how this gate ended up running on
+        # synthetic audio while reporting success.
+        a = sr = None
+        if hasattr(v, "get_all_samples"):
+            smp = v.get_all_samples()
+            a = smp.data.to(torch.float32)
+            a = a.mean(0) if a.ndim > 1 else a          # downmix to mono
+            a = a.numpy()
+            sr = int(smp.sample_rate)
+        elif isinstance(v, dict) and "array" in v:
             a = np.asarray(v["array"], dtype=np.float32)
             sr = int(v.get("sampling_rate", ML.AUDIO_SR))
-            if sr != ML.AUDIO_SR:                      # cheap linear resample; fine for a gate
-                n = int(len(a) * ML.AUDIO_SR / sr)
-                a = np.interp(np.linspace(0, len(a) - 1, n), np.arange(len(a)), a).astype("float32")
-            wave, provenance = a[: ML.AUDIO_SR * 10], f"gpt-omni/VoiceAssistant-400K field '{k}'"
-            break
+        if a is None or a.size < ML.AUDIO_SR // 2:
+            continue
+        if sr != ML.AUDIO_SR:                           # cheap linear resample; fine for a gate
+            n = int(len(a) * ML.AUDIO_SR / sr)
+            a = np.interp(np.linspace(0, len(a) - 1, n), np.arange(len(a)), a).astype("float32")
+        pk = float(np.abs(a).max()) or 1.0
+        wave = (a[: ML.AUDIO_SR * 10] / pk * 0.7).astype("float32")
+        provenance = f"REAL SPEECH -- gpt-omni/VoiceAssistant-400K field '{k}' @ {sr} Hz"
+        del smp, a
+        break
+    # Drop every reference to the decoder and the streaming iterator before moving on: torchcodec
+    # and the HF streaming client both keep native threads alive, and letting them survive into
+    # interpreter finalisation ends in "PyGILState_Release: thread state must be current" and a
+    # core dump AFTER the gate has already passed -- a green run with a non-zero exit code, which
+    # is the worst possible outcome for something meant to gate a chain.
+    row.clear()
+    del ds, row
+    import gc as _gc; _gc.collect()
 except Exception as e:
     print(f"  (could not stream real speech: {type(e).__name__}: {str(e)[:90]})", flush=True)
 
@@ -132,6 +156,8 @@ for ms in ("htk", "slaney"):
         except Exception as e:
             print(f"    mel_scale={ms:7} norm={str(nm):7}  FAILED {type(e).__name__}", flush=True)
 check("every candidate convention ran", len(results) == 4, f"{len(results)}/4")
+check("the convention test used REAL speech, not the synthetic fallback",
+      provenance.startswith("REAL"), provenance)
 if results:
     best = max(results, key=results.get)
     spread = max(results.values()) - min(results.values())
@@ -163,4 +189,9 @@ check("audio embeddings splice at the placeholders",
       f"{n_a} audio tokens")
 
 print("\nGATE " + ("PASS" if not fail else f"FAIL ({fail})"))
-sys.exit(1 if fail else 0)
+sys.stdout.flush(); sys.stderr.flush()
+# os._exit, not sys.exit: see the cleanup note above. Native decoder threads can still be
+# unwinding, and finalising the interpreter under them turns a passing gate into a core dump.
+# Everything this script owns is already written and flushed by here.
+import os as _os
+_os._exit(1 if fail else 0)

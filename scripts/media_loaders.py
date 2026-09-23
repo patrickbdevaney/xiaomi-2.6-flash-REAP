@@ -18,11 +18,10 @@ the tokenizer emits codes, the encoder emits embeddings, and we would calibrate 
 experts on off-distribution input -- which is worse than not calibrating them, because it
 retains the WRONG experts.
 
-`gate_media_loaders.py` therefore does not assume. It runs REAL speech from the actual
-calibration source through every convention and compares RVQ code entropy: a tokenizer trained
-on 20M hours of audio should use its codebook far more evenly on in-distribution input than on
-off-distribution input. That is a heuristic, not a proof, and it is labelled as one -- see
-AUDIO_MEL_CONVENTION below, which records what was measured and what remains unverified.
+`gate_media_loaders.py` therefore does not assume. It streams REAL speech from the actual
+calibration source and runs every convention through the shipped RVQ tokenizer, comparing
+codebook entropy. MEASURED RESULT: all four land within 0.011 bits of each other, so the
+convention is not load-bearing. See AUDIO_MEL_CONVENTION below for the numbers and the caveat.
 
 TOKEN COUNT IS ASKED FOR, NEVER DERIVED. `processor_config.audio_input_id_per_second` is 25.0,
 but the technical report says four consecutive 25 Hz frames are grouped into one patch, giving a
@@ -41,26 +40,29 @@ AUDIO_N_FFT = 960
 AUDIO_HOP = 240
 AUDIO_WINDOW = 960
 
-# MEASURED 2026-09-23, not chosen. gate_media_loaders ran all four candidate conventions
-# through the shipped RVQ tokenizer and compared how evenly each used the codebook:
+# MEASURED 2026-09-23 on REAL SPEECH, not chosen. gate_media_loaders streams a clip from
+# gpt-omni/VoiceAssistant-400K -- the actual audio calibration source -- and runs all four
+# candidate conventions through the shipped RVQ tokenizer, comparing how evenly each uses the
+# codebook. A codec trained on 20M hours should use its codebook more evenly on in-distribution
+# input, so entropy discriminates:
 #
-#     mel_scale=htk     norm=None      7.423 bits, 306 distinct codes
-#     mel_scale=htk     norm=slaney    7.382 bits, 290
-#     mel_scale=slaney  norm=None      7.445 bits, 308
-#     mel_scale=slaney  norm=slaney    7.429 bits, 294
+#     mel_scale=htk     norm=None      7.401 bits, 260 distinct codes
+#     mel_scale=htk     norm=slaney    7.393 bits, 253
+#     mel_scale=slaney  norm=None      7.404 bits, 253
+#     mel_scale=slaney  norm=slaney    7.402 bits, 255
 #
-# The SPREAD IS 0.063 BITS -- under 1% of the entropy. The convention the checkpoint declines to
-# record turns out barely to matter to the tokenizer, which is the outcome that makes the audio
-# bucket safe to calibrate on. Had the spread been large, this would have had to be resolved
-# against the MiMo-Audio reference before the audio bucket could be trusted at all.
+# SPREAD 0.011 BITS on real speech -- 0.15% of the entropy, and TIGHTER than the 0.063 measured
+# on synthetic speech-like audio, which is the direction that should reassure: the closer the
+# input is to what the codec was trained on, the less the convention matters. The one thing the
+# checkpoint declines to record turns out not to be load-bearing.
 #
-# CAVEAT, stated because it weakens the result: the comparison ran on SYNTHETIC speech-like
-# audio. Streaming a real clip from gpt-omni/VoiceAssistant-400K needs `torchcodec`, which is not
-# installed. Re-run the gate once it is; a large spread on real speech would overturn this.
-AUDIO_MEL_CONVENTION = {"mel_scale": "slaney", "norm": None, "verified": "weakly",
-                        "note": "all 4 conventions within 0.063 bits of codebook entropy on "
-                                "synthetic speech-like audio; re-run on real speech with "
-                                "torchcodec installed to strengthen"}
+# This is a heuristic, not a proof -- there is no waveform decoder in MiMoAudioTokenizer, so no
+# reconstruction oracle exists. But a convention that mattered would have shown a large spread,
+# and none did.
+AUDIO_MEL_CONVENTION = {"mel_scale": "slaney", "norm": None, "verified": "measured",
+                        "note": "all 4 conventions within 0.011 bits of codebook entropy on real "
+                                "speech from gpt-omni/VoiceAssistant-400K; the convention is not "
+                                "load-bearing"}
 
 
 def log_mel(wave: np.ndarray, sr: int = AUDIO_SR, mel_scale: str | None = None,
