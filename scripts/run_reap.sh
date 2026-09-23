@@ -23,6 +23,14 @@ say "REAP run start: $TOTAL tokens, seq_len $SEQ, free $(df -h / | awk 'NR==2{pr
 # which is all the memguard did at the time, reclaimed nothing. So: reclaim with the full
 # shrinker, then REFUSE TO START if the box is still short. Starting a 34-hour run into a
 # poisoned allocator only buys another 7-minute failure, and the corpus stage is not resumable.
+# VOLUNTEER AS THE OOM VICTIM. On this box there is no kernel-side limit that can bound a CUDA
+# allocation: unified memory means the driver pins ordinary system RAM, which is charged to no
+# cgroup and appears in no Rss counter, so `MemoryMax` cannot constrain it and the OOM killer --
+# which ranks by RSS -- has repeatedly picked the wrong process. The only remaining lever is to
+# make OURSELVES the preferred victim, so that when the box is cornered it takes this run (which
+# resumes exactly, per bucket in stage 1 and per chunk in stage 2, and is restarted automatically)
+# instead of the session or the desktop. The media worker sets 1000 so it is taken before us.
+echo 500 > /proc/self/oom_score_adj 2>/dev/null || say "WARN: could not set oom_score_adj"
 MIN_AVAIL_MB=${MIN_AVAIL_MB:-90000}
 sync; sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || say "WARN: drop_caches unavailable"
 AVAIL=$(awk '/MemAvailable:/{print int($2/1024)}' /proc/meminfo)

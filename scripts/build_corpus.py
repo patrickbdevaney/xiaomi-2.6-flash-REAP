@@ -34,6 +34,7 @@ import torch
 import mimo_corpus_spec as SPEC
 import media_loaders as ML
 from chunk_builder import Embedder, ChunkWriter
+from media_worker import MediaWorker
 
 
 # ---------------------------------------------------------------- row adapters
@@ -234,8 +235,11 @@ class Packer:
     every media row lands on the wrong token, silently.
     """
 
-    def __init__(self, embedder, seq_len: int, eos: int):
-        self.E, self.S, self.eos = embedder, seq_len, eos
+    def __init__(self, embedder, seq_len: int, eos: int, worker=None):
+        # `worker` runs the towers in a disposable subprocess (see media_worker). When it is
+        # set the Packer never touches a tower itself, so nothing in THIS process can allocate
+        # the box away.
+        self.E, self.S, self.eos, self.worker = embedder, seq_len, eos, worker
         self.reset()
 
     def reset(self):
@@ -272,9 +276,18 @@ class Packer:
         valid = torch.zeros(1, self.S, dtype=torch.bool); valid[0, :n] = True
         me, tokid = None, None
         if self.pix:
-            me = self.E._lazy("visual")(
-                pixel_values=torch.cat(self.pix, 0).to(self.E.device),
-                grid_thw=torch.cat(self.grid, 0).to(self.E.device))
+            pv, gr = torch.cat(self.pix, 0), torch.cat(self.grid, 0)
+            if self.worker is not None:
+                me = self.worker.visual(pv, gr)
+                if me is None:
+                    # The worker died or refused. Drop the whole packed sequence rather than
+                    # splice media onto the wrong tokens -- losing one sequence is free, a
+                    # misaligned splice is silent corruption.
+                    self.reset()
+                    return None
+            else:
+                me = self.E._lazy("visual")(pixel_values=pv.to(self.E.device),
+                                            grid_thw=gr.to(self.E.device))
             tokid = self.E.ids[self.kind]
         elif self.audio:
             me = torch.cat(self.audio, 0)
@@ -301,9 +314,13 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
     cfg._attn_implementation = "flex_attention" if device.startswith("cuda") else "eager"
     tok = AutoTokenizer.from_pretrained(src, trust_remote_code=True)
     proc = AutoProcessor.from_pretrained(src, trust_remote_code=True)
-    E = Embedder(src, cfg, device=device)
+    # The PARENT holds no CUDA context and no towers. Everything that can allocate at scale
+    # lives in the worker, which is expendable; this process only streams rows, tokenises, and
+    # writes chunks. That is what makes an unforeseen allocation cost a sample instead of the
+    # run -- see media_worker for why no kernel-side limit is available on this machine.
+    E = Embedder(src, cfg, device="cpu")
     V = ML.VideoLoader(E, proc)
-    A = ML.AudioLoader(E, src)
+    MW = MediaWorker(src, device=device)
     lim = ML.configure_media_limits(proc, cfg)
     print(f"media limits: <= {lim['max_patch_rows']} patch rows per tower chunk "
           f"(image <= {lim['image_max_pixels']:,} px, video <= "
@@ -328,7 +345,7 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
             print(f"  {bucket:11} SKIPPED (checkpointed)", flush=True)
             continue
         got = 0
-        P = Packer(E, seq_len, eos)
+        P = Packer(E, seq_len, eos, worker=MW)
 
         def emit(force=False):
             nonlocal got
@@ -402,7 +419,9 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
                                       grid=prep["image_grid_thw"], kind="image")
                             else:
                                 wave, text = row_audio(row)
-                                ae = A.embed([wave])
+                                ae = MW.audio([wave])
+                                if ae is None:
+                                    continue
                                 ids = tok(text or "Transcribe and answer.",
                                           add_special_tokens=False)["input_ids"]
                                 ids = ids + [E.ids["audio"]] * ae.shape[0]
@@ -460,6 +479,10 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
         W.checkpoint(bucket)
 
     W.close()
+    if MW.deaths or MW.skipped:
+        print(f"media worker: {MW.deaths} restart(s), {MW.skipped} sample(s) dropped",
+              flush=True)
+    MW.close()
     print(f"wrote {W.n_chunks} chunks to {out_dir}", flush=True)
     return W.n_chunks
 
