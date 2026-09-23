@@ -44,10 +44,10 @@ LAYER_INDEX: dict[str, int] = {}
 BUCKETS: list[str] = []
 
 
-def configure(buckets, n_layers: int, n_experts: int) -> None:
+def configure(buckets, n_layers: int, n_experts: int, device="cpu") -> None:
     global FACC, BUCKETS
     BUCKETS = list(buckets)
-    FACC = FAccumulator(n_layers, n_experts)
+    FACC = FAccumulator(n_layers, n_experts, device=device)
 
 
 def _ensure(lname: str, n_experts: int, dev) -> dict:
@@ -81,10 +81,22 @@ def patch(mod) -> None:
             raise RuntimeError(
                 f"valid mask length {valid.shape[0]} != {hidden_states.shape[0]} expert rows in "
                 f"{lname}; token flattening is not 1:1, fix the mask construction")
-        # Per-token, per-SLOT gated magnitudes, filled in as the expert loop visits each slot.
-        # `weight_indices` from torch.where IS the slot, which is what makes the F-matrix
-        # outer product possible without a second pass over the experts.
-        S = torch.zeros_like(topk_weights, dtype=torch.float64) if acc is not None else None
+        # Per-token, per-SLOT scratch, filled as the expert loop visits each slot.
+        # `weight_indices` from torch.where IS the slot, which is what lets the F-matrix outer
+        # product AND every per-expert statistic be computed from one pass over the experts.
+        #
+        # WHY THE REDUCTIONS ARE NOT DONE INSIDE THE LOOP. They were, and it cost 0.155 s on top
+        # of a 0.196 s layer forward -- 79% overhead, measured. Seven scalar `+=` into float64
+        # accumulators per expert is 7 x 256 = 1,792 tiny kernel launches per layer, and the
+        # launches were the cost, not the arithmetic. Moving the accumulators to the GPU changed
+        # nothing, which is what proved it: launch-bound, not transfer-bound, the same lesson the
+        # KDA decode work learned. Scattering into [N, K] here and reducing once afterwards makes
+        # it 2 x 256 writes plus 7 reductions.
+        if acc is not None:
+            S = torch.zeros_like(topk_weights, dtype=torch.float64)
+            NR = torch.zeros_like(topk_weights, dtype=torch.float64)
+        else:
+            S = NR = None
 
         for expert_idx, expert in enumerate(self.experts):
             mask = expert_mask[expert_idx]
@@ -92,31 +104,31 @@ def patch(mod) -> None:
             if token_indices.numel() > 0:
                 expert_weights = topk_weights[token_indices, weight_indices]
                 expert_input = hidden_states[token_indices]
-                expert_output = expert(expert_input)               # f_j, UNGATED -- what REAP is defined over
+                expert_output = expert(expert_input)      # f_j, UNGATED -- what REAP is defined over
                 final_hidden_states.index_add_(
                     0, token_indices, expert_output * expert_weights.unsqueeze(-1))
                 if acc is not None:
                     with torch.no_grad():
-                        keep = valid[token_indices] if valid is not None else None
-                        f_v = expert_output if keep is None else expert_output[keep]
-                        g_v = expert_weights if keep is None else expert_weights[keep]
-                        if f_v.shape[0]:
-                            nrm = f_v.to(torch.float32).norm(dim=-1).double()
-                            g = g_v.to(torch.float64)
-                            sv = g * nrm
-                            acc["sum"][bkt, expert_idx] += sv.sum()
-                            acc["sq"][bkt, expert_idx] += (sv * sv).sum()
-                            acc["cnt"][bkt, expert_idx] += f_v.shape[0]
-                            acc["nrm"][bkt, expert_idx] += nrm.sum()
-                            acc["nsq"][bkt, expert_idx] += (nrm * nrm).sum()
-                            acc["gat"][bkt, expert_idx] += g.sum()
-                            acc["gsq"][bkt, expert_idx] += (g * g).sum()
-                            # Same values into the per-slot scratch, so F sees EXACTLY the
-                            # tokens the per-expert stats saw. gate_mimo_saliency asserts
-                            # F[k,k] == sq/cnt, which is what catches any drift between them.
-                            ti = token_indices if keep is None else token_indices[keep]
-                            wi = weight_indices if keep is None else weight_indices[keep]
-                            S[ti, wi] = sv
+                        nrm = expert_output.to(torch.float32).norm(dim=-1).double()
+                        NR[token_indices, weight_indices] = nrm
+                        S[token_indices, weight_indices] = expert_weights.to(torch.float64) * nrm
+
+        if acc is not None:
+            with torch.no_grad():
+                # One vectorised reduction over every routed slot. `valid` selects the rows that
+                # count; every (token, slot) pair is routed by construction, so the only filter
+                # is the token mask.
+                flat_e = topk_indices.reshape(-1)
+                sv, nv = S.reshape(-1), NR.reshape(-1)
+                gv = topk_weights.reshape(-1).to(torch.float64)
+                if valid is not None:
+                    sel = valid[:, None].expand_as(S).reshape(-1)
+                    flat_e, sv, nv, gv = flat_e[sel], sv[sel], nv[sel], gv[sel]
+                one = torch.ones_like(sv)
+                for key, val in (("sum", sv), ("sq", sv * sv), ("cnt", one),
+                                 ("nrm", nv), ("nsq", nv * nv),
+                                 ("gat", gv), ("gsq", gv * gv)):
+                    acc[key][bkt].index_add_(0, flat_e, val)
 
         if acc is not None and FACC is not None and lname in LAYER_INDEX:
             # ONLY the valid rows. F's denominator is |X_ij|, the number of tokens routing both

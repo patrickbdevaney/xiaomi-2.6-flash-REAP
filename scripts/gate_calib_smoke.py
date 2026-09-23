@@ -6,10 +6,17 @@ checkpoint, push a tiny batch through it, and assert that the statistics the who
 on actually filled. Everything before this was gated against synthetic fixtures or another
 implementation; this is the first gate against the model itself.
 """
-import sys, time
+import argparse, sys, time
 from pathlib import Path
 
 import torch
+
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--device", default="cpu")
+_ap.add_argument("--seq", type=int, default=24)
+_ap.add_argument("--batch", type=int, default=2)
+A = _ap.parse_args()
+DEV = A.device
 
 sys.path.insert(0, "scripts")
 import mimo_saliency as MS
@@ -32,7 +39,11 @@ if not (SRC / "model.safetensors.index.json").exists():
 from transformers import AutoConfig
 cfg = AutoConfig.from_pretrained(SRC, trust_remote_code=True)
 cfg._name_or_path = str(SRC)
-cfg._attn_implementation = "eager"   # CPU smoke; the real pass uses flex_attention on CUDA (see calib_pass)
+# Same selection the driver makes, so the smoke exercises the backend the pass will use:
+# flex_attention on CUDA (the only one that handles the sink bias without densifying), eager
+# on CPU (the sinks cannot run under flex there).
+cfg._attn_implementation = "flex_attention" if DEV.startswith("cuda") else "eager"
+print(f"  (device {DEV}, attn {cfg._attn_implementation}, seq {A.seq}, batch {A.batch})", flush=True)
 check("config is MiMoV2 with the expected shape",
       cfg.num_hidden_layers == 48 and cfg.n_routed_experts == 256
       and cfg.num_experts_per_tok == 8 and cfg.hidden_size == 4096,
@@ -41,37 +52,43 @@ check("config is MiMoV2 with the expected shape",
 LI = 1                                   # an SWA MoE layer (hybrid_layer_pattern[1] == 1)
 reader = ShardReader(SRC)
 t0 = time.time()
-layer = CP.build_layer(cfg, LI, reader, torch.float32)
+layer = CP.build_layer(cfg, LI, reader, torch.bfloat16 if DEV.startswith("cuda") else torch.float32).to(DEV)
 print(f"  (built layer {LI} from real shards in {time.time()-t0:.0f}s)", flush=True)
 check("layer is SWA as the hybrid pattern says",
       layer.attention_type == "sliding_window_attention", layer.attention_type)
 check("MoE has all 256 experts materialised", len(layer.mlp.experts) == 256)
 w = layer.mlp.experts[0].gate_proj.weight
 check("expert weights dequantised to a real dtype, finite, non-trivial",
-      w.dtype == torch.float32 and torch.isfinite(w).all() and w.std().item() > 1e-4,
+      w.dtype in (torch.float32, torch.bfloat16) and torch.isfinite(w).all() and w.std().item() > 1e-4,
       f"{tuple(w.shape)} std {w.std().item():.5f}")
 
 MS.configure(["code", "ballast"], n_layers=cfg.num_hidden_layers, n_experts=cfg.n_routed_experts)
 MS.LAYER_INDEX[f"model.layers.{LI}.mlp"] = LI
 MS.patch(CP._modeling(cfg))
 
-B, S = 2, 24
-hs = torch.randn(B, S, cfg.hidden_size, dtype=torch.float32) * 0.02
-pos = torch.arange(S)[None]
-masks = CP.masks_for(S, cfg.sliding_window, "cpu", torch.float32)
-valid = torch.ones(B, S, dtype=torch.bool); valid[1, -6:] = False     # exercise the mask path
+B, S = A.batch, A.seq
+DT = torch.bfloat16 if DEV.startswith("cuda") else torch.float32
+hs = (torch.randn(B, S, cfg.hidden_size, dtype=torch.float32) * 0.02).to(DEV, DT)
+pos = torch.arange(S, device=DEV)[None]
+masks = CP.masks_for(S, cfg.sliding_window, DEV, DT)
+valid = torch.ones(B, S, dtype=torch.bool, device=DEV); valid[-1, -6:] = False     # exercise the mask path
 
 MS.CTX.update({"layer": f"model.layers.{LI}.mlp", "bucket": 0, "valid": valid.reshape(-1)})
-pe = CP._rope(cfg, layer.attention_type, hs, pos, "cpu", torch.float32)
+pe = CP._rope(cfg, layer.attention_type, hs, pos, DEV, DT)
 t0 = time.time()
 with torch.no_grad():
     out = layer(hs, attention_mask=masks[layer.attention_type], position_ids=pos,
                 position_embeddings=pe)
-print(f"  (forward {B}x{S} in {time.time()-t0:.1f}s)", flush=True)
+if DEV.startswith("cuda"):
+    torch.cuda.synchronize()
+    print(f"  (forward {B}x{S} in {time.time()-t0:.1f}s, peak GPU "
+          f"{torch.cuda.max_memory_allocated()/2**30:.1f} GiB)", flush=True)
+else:
+    print(f"  (forward {B}x{S} in {time.time()-t0:.1f}s)", flush=True)
 
 check("output shape and finiteness", out.shape == hs.shape and torch.isfinite(out).all(),
       str(tuple(out.shape)))
-check("the layer actually changed the hidden states", not torch.allclose(out, hs))
+check("the layer actually changed the hidden states", not torch.allclose(out.float(), hs.float()))
 
 acc = MS.ACC[f"model.layers.{LI}.mlp"]
 routed = acc["cnt"].sum().item()

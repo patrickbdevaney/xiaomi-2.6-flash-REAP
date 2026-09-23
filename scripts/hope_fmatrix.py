@@ -32,14 +32,20 @@ class FAccumulator:
 
     float64 because these are long running sums over millions of tokens and the whole point is a
     second-order term; float32 drift here would be indistinguishable from the signal we are
-    trying to measure. CPU because 49 MB of accumulator has no business competing with the model
-    for device memory during a pass that is already at the edge of the envelope.
+    trying to measure.
+
+    ON THE COMPUTE DEVICE by default in the pass. The first version kept these on CPU, reasoning
+    that 47 MiB had no business competing with the model for device memory. That was the wrong
+    trade and it was measured, not argued: a per-batch device-to-host copy of the [N,8,8] pair
+    tensor plus a CPU index_add_ cost 0.15 s on top of a 0.20 s layer forward -- 75% overhead --
+    while the 47 MiB it saved is 0.04% of the envelope.
     """
 
-    def __init__(self, n_layers: int, n_experts: int):
+    def __init__(self, n_layers: int, n_experts: int, device="cpu"):
         self.E = n_experts
-        self.sum = torch.zeros(n_layers, n_experts, n_experts, dtype=torch.float64)
-        self.cnt = torch.zeros(n_layers, n_experts, n_experts, dtype=torch.float64)
+        self.device = device
+        self.sum = torch.zeros(n_layers, n_experts, n_experts, dtype=torch.float64, device=device)
+        self.cnt = torch.zeros(n_layers, n_experts, n_experts, dtype=torch.float64, device=device)
 
     def update(self, layer: int, topk_idx: torch.Tensor, s: torch.Tensor) -> None:
         """topk_idx [N, K] expert ids per token; s [N, K] = g * ||f|| for those same slots.
@@ -51,8 +57,8 @@ class FAccumulator:
         """
         if topk_idx.numel() == 0:
             return
-        idx = topk_idx.to(torch.long).cpu()
-        v = s.to(torch.float64).cpu()
+        idx = topk_idx.to(torch.long).to(self.device)
+        v = s.to(torch.float64).to(self.device)
         N, K = idx.shape
         # [N,K,K] outer products; pair (a,b) of slots -> experts (idx[:,a], idx[:,b]).
         pair = v[:, :, None] * v[:, None, :]
@@ -70,7 +76,7 @@ class FAccumulator:
         """
         c = self.cnt[layer].clone()
         c[c == 0] = 1.0
-        return (self.sum[layer] / c).numpy()
+        return (self.sum[layer] / c).cpu().numpy()
 
 
 def _project_capped_simplex(p: np.ndarray, k: float) -> np.ndarray:

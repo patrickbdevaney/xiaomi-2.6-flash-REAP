@@ -120,7 +120,7 @@ def run(src, chunks_dir, out_dir, device="cuda", dtype=torch.bfloat16,
     chunk_files = sorted(chunks_dir.glob("chunk_*.pt"))[: smoke_chunks or None]
     assert chunk_files, f"no chunks in {chunks_dir}"
 
-    MS.configure(buckets, n_layers=n_layers, n_experts=n_exp)
+    MS.configure(buckets, n_layers=n_layers, n_experts=n_exp, device=device)
     MS.LAYER_INDEX.update({f"model.layers.{i}.mlp": i for i in range(n_layers)})
     MS.patch(_modeling(cfg))
 
