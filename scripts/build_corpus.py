@@ -304,6 +304,10 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
     E = Embedder(src, cfg, device=device)
     V = ML.VideoLoader(E, proc)
     A = ML.AudioLoader(E, src)
+    lim = ML.configure_media_limits(proc, cfg)
+    print(f"media limits: <= {lim['max_patch_rows']} patch rows per tower chunk "
+          f"(image <= {lim['image_max_pixels']:,} px, video <= "
+          f"{lim['video_max_pixels_per_frame']:,} px/frame at T={lim['t_grid']})", flush=True)
 
     buckets = list(SPEC.TOKEN_TARGET)
     want = {b: int(total_tokens * SPEC.TOKEN_TARGET[b]) for b in buckets}
@@ -313,6 +317,7 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
     for b in buckets:
         print(f"  {b:11} {want[b]:>12,}", flush=True)
 
+    oversize: dict[str, int] = {}
     already = W.resume()
     if already:
         print(f"resuming corpus build: {len(already)} buckets already collected "
@@ -344,7 +349,14 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
                 for frames, text in stream:
                     if got >= want[bucket]:
                         break
+                    frames = ML.fit_frames(frames, cfg)
                     prep = V.prepare(frames)
+                    # A clip is ONE attention chunk (grid is T,h,w and L = T*h*w), so the whole
+                    # clip must fit the budget, not each frame.
+                    L = ML.patch_rows(prep["grid_thw"])
+                    if L > ML.MAX_PATCH_ROWS:
+                        oversize["video"] = oversize.get("video", 0) + 1
+                        continue
                     n = V.n_tokens(prep)
                     ids = tok(text or "Describe this video.", add_special_tokens=False)["input_ids"]
                     ids = ids + [E.ids["video"]] * n
@@ -368,7 +380,17 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
                         try:
                             if bucket == "image":
                                 img, text = row_image(row)
+                                img = ML.fit_image(img, cfg)
                                 prep = proc.image_processor(images=[img], return_tensors="pt")
+                                # THE HARD STOP. The cap above is a hint to the processor; this
+                                # is the guarantee. One sample whose attention length exceeds
+                                # the budget allocates tens of GB in a single burst and the box
+                                # is gone -- no retry, no resume, just SIGKILL. Skipping the
+                                # sample costs nothing; there are millions more.
+                                L = ML.patch_rows(prep["image_grid_thw"])
+                                if L > ML.MAX_PATCH_ROWS:
+                                    oversize[bucket] = oversize.get(bucket, 0) + 1
+                                    continue
                                 n = int(prep["image_grid_thw"].prod(-1).sum()) // (
                                     cfg.vision_config["spatial_merge_size"] ** 2)
                                 ids = tok(text or "Describe this image.",
@@ -416,6 +438,9 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
                     P.add(ids)
                     emit()
         emit(force=True)
+        if oversize.get(bucket):
+            print(f"    skipped {oversize[bucket]:,} oversized {bucket} sample(s) over the "
+                  f"{ML.MAX_PATCH_ROWS}-patch-row budget", flush=True)
         frac = got / max(1, want[bucket])
         print(f"  {bucket:11} collected {got:,} / {want[bucket]:,} tokens ({frac:.0%})",
               flush=True)

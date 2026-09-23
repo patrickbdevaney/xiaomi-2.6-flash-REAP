@@ -41,6 +41,38 @@ AUDIO_HOP = 240
 AUDIO_WINDOW = 960
 # Clip lengths from mimo_corpus_spec.CLIP_SECONDS, mirrored here so the loaders do not import
 # the spec (the spec imports the corpus, and the loaders must stay usable on their own).
+# ---------------------------------------------------------------- the patch-row budget
+#
+# THE ALLOCATION THAT KILLED THREE RUNS. MiMoVisionAttention materialises a DENSE
+# [1, num_heads, L, L] tensor for every attention chunk -- not as a fallback, but explicitly,
+# purely to place a sink bias in column 0:
+#
+#     sink_bias = torch.zeros(1, self.num_heads, q_c.shape[2], k_c.shape[2], ...)
+#     sink_bias[..., 0] = self.sinks.view(1, self.num_heads, 1)
+#     attn_mask = sink_bias if attn_mask is None else attn_mask + sink_bias
+#
+# `attn_mask + sink_bias` makes a second copy, and passing an explicit float mask to
+# scaled_dot_product_attention forces the math path, which materialises the scores as a third.
+# The 24 windowed blocks additionally build a dense [L, L] mask. With num_heads=32 the cost is
+# ~64 L^2 bytes PER COPY.
+#
+# MEASURED: a WebSight screenshot is 2560x2176 -> L = 21,760 patch rows -> 30.3 GB per copy.
+# The run lost 95 GB in under five seconds and was OOM-killed; `cached` never moved, because
+# this is a live allocation, not page cache. The checkpoint's own preprocessor_config allows
+# max_pixels = 12,845,056, i.e. L = 50,176, which would be a 161 TB sink_bias -- the configured
+# cap is effectively absent, so it must be supplied here.
+#
+# L_MAX is therefore chosen from the memory it costs, not from image aesthetics:
+#     bytes ~= 4 copies * 32 heads * L^2 * 2 B = 256 * L^2
+#     L=4096 -> 4.3 GB      L=3072 -> 2.4 GB      L=2048 -> 1.07 GB
+# 4096 patch rows = 1024 merged tokens, so a capped image still occupies a quarter of a
+# 4096-token sequence -- ample for calibration, where COVERAGE matters and resolution does not.
+MAX_PATCH_ROWS = 4096
+
+# Video packs the WHOLE CLIP into a single attention chunk: grid is (T, h, w) with
+# T = frames / temporal_patch_size, and L = T*h*w. Ten 1080p frames would be T=5, h*w=8160,
+# L=40,800 -- four times worse than the screenshot that killed the run. The per-frame budget is
+# therefore the total budget divided by the temporal extent.
 CLIP_SECONDS_AUDIO = 30
 CLIP_FRAMES_VIDEO = 10
 
@@ -149,3 +181,76 @@ class VideoLoader:
     def n_tokens(self, prepared: dict) -> int:
         merge = self.E.cfg.vision_config["spatial_merge_size"]
         return int(prepared["grid_thw"].prod(-1).sum().item()) // (merge ** 2)
+
+
+def patch_rows(grid_thw) -> int:
+    """Attention length L the vision tower will actually run at, summed over the chunk."""
+    return int(grid_thw.prod(-1).sum().item())
+
+
+def fit_image(img, cfg, max_patch_rows: int = MAX_PATCH_ROWS):
+    """Downscale a PIL image so the tower's attention length stays inside the budget.
+
+    We resize the image OURSELVES rather than asking the processor to. Setting `max_pixels`
+    (and `size["longest_edge"]`) on Qwen2VLImageProcessor was MEASURED to change nothing: a
+    WebSight screenshot still came back as 21,760 patch rows, the exact value that killed the
+    run. A cap that the downstream component is free to ignore is not a cap, and the failure
+    mode is a machine-wide SIGKILL, so this is enforced where it cannot be overridden.
+
+    Aspect ratio is preserved; only images already over budget are touched.
+    """
+    vc = cfg.vision_config
+    patch = int(vc["patch_size"] if isinstance(vc, dict) else vc.patch_size)
+    budget_px = max_patch_rows * patch * patch
+    w, h = img.size
+    if w * h <= budget_px:
+        return img
+    scale = (budget_px / float(w * h)) ** 0.5
+    # floor to whole patches, and leave a patch of slack so rounding inside the processor
+    # cannot push it back over the budget
+    nw = max(patch, int(w * scale) // patch * patch - patch)
+    nh = max(patch, int(h * scale) // patch * patch - patch)
+    from PIL import Image
+    return img.resize((nw, nh), Image.BICUBIC)
+
+
+def fit_frames(frames, cfg, max_patch_rows: int = MAX_PATCH_ROWS,
+               frames_per_clip: int = CLIP_FRAMES_VIDEO):
+    """Same, for a video clip: the WHOLE clip is one attention chunk, so the budget is shared
+    across the temporal extent rather than applied per frame."""
+    vc = cfg.vision_config
+    tpatch = int((vc["temporal_patch_size"] if isinstance(vc, dict) else vc.temporal_patch_size)
+                 or 1)
+    t_grid = max(1, len(frames) // max(1, tpatch))
+    per_frame = max(64, max_patch_rows // t_grid)
+    return [fit_image(f, cfg, per_frame) for f in frames]
+
+
+def configure_media_limits(proc, cfg, max_patch_rows: int = MAX_PATCH_ROWS,
+                           frames_per_clip: int = CLIP_FRAMES_VIDEO) -> dict:
+    """Cap the processors so no sample can hand the tower an L that will not fit.
+
+    Returns the limits applied, for the log -- a silent cap is how the original 12.8M-pixel
+    default went unnoticed.
+    """
+    vc = cfg.vision_config
+    patch = int(vc["patch_size"] if isinstance(vc, dict) else vc.patch_size)
+    tpatch = int((vc["temporal_patch_size"] if isinstance(vc, dict) else vc.temporal_patch_size)
+                 or 1)
+    img_px = max_patch_rows * patch * patch
+    t_grid = max(1, frames_per_clip // tpatch)
+    vid_px = max(patch * patch, (max_patch_rows // t_grid) * patch * patch)
+    applied = {"max_patch_rows": max_patch_rows, "image_max_pixels": img_px,
+               "video_max_pixels_per_frame": vid_px, "t_grid": t_grid}
+    for name, px in (("image_processor", img_px), ("video_processor", vid_px)):
+        sub = getattr(proc, name, None)
+        if sub is None:
+            continue
+        for attr in ("max_pixels",):
+            if hasattr(sub, attr):
+                setattr(sub, attr, px)
+        # Newer processors carry the bound inside `size`, and ignore the flat attribute.
+        sz = getattr(sub, "size", None)
+        if isinstance(sz, dict) and "longest_edge" in sz:
+            sz["longest_edge"] = px
+    return applied
