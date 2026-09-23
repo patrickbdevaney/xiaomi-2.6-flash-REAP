@@ -6,6 +6,17 @@ unified-memory box (Jetson AGX Thor) at full 1M context.
 Nothing published does this. ggml-org's own Q2_K GGUF is **126 GB** — over the envelope before a
 single KV byte — and the only existing REAP50 of this model is Apple MLX and text-only.
 
+## What is in this repository
+
+**Code only.** This repo is the REAP pipeline: the calibration corpus builder, the saliency and
+HOPE F-matrix accumulators, the layer-sequential pass, and the gates that hold all of it to
+measured evidence.
+
+**No weights, no corpora, no pass outputs.** Model weights, the calibration corpus and the
+resulting pruned checkpoints are published on HuggingFace, not committed here. `.gitignore`
+enforces this by directory *and* by extension, because the original rule (`artifacts/*.pt`) did
+not recurse into `artifacts/chunks/` and quietly committed corpus chunks before anyone noticed.
+
 ## Why this model, and why 50%
 
 `quantization_config.store_dtype = "mxfp4"`: the routed experts already ship as packed FP4
