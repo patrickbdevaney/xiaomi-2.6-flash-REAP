@@ -84,8 +84,7 @@ except AssertionError as e:
 import tempfile
 with tempfile.TemporaryDirectory() as td:
     w = ChunkWriter(td, ["code", "image"], tokens_per_chunk=10**9)
-    w.add(torch.zeros(1, 4, cfg.hidden_size), torch.ones(1, 4, dtype=torch.bool), "image",
-          had_media=False)
+    w.add(torch.zeros(1, 4, dtype=torch.long), torch.ones(1, 4, dtype=torch.bool), "image")
     try:
         w.close(); check("a text-only image bucket is refused", False)
     except RuntimeError as e:
@@ -93,16 +92,29 @@ with tempfile.TemporaryDirectory() as td:
 
 with tempfile.TemporaryDirectory() as td:
     w = ChunkWriter(td, ["code", "image"], tokens_per_chunk=10**9)
-    w.add(torch.zeros(1, 4, cfg.hidden_size), torch.ones(1, 4, dtype=torch.bool), "image",
-          had_media=True)
-    w.add(torch.zeros(1, 6, cfg.hidden_size), torch.ones(1, 6, dtype=torch.bool), "code")
+    IMG = E.ids["image"]
+    w.add(torch.full((1, 4), IMG, dtype=torch.long), torch.ones(1, 4, dtype=torch.bool), "image",
+          media_embeds=torch.zeros(4, cfg.hidden_size), media_token_id=IMG)
+    w.add(torch.zeros(1, 6, dtype=torch.long), torch.ones(1, 6, dtype=torch.bool), "code")
     w.close()
     man = __import__("json").loads((Path(td) / "manifest.json").read_text())
     check("manifest records per-bucket token and media counts",
           man["tokens_by_bucket"] == {"code": 6, "image": 4}
           and man["media_tokens_by_bucket"]["image"] == 4, str(man["tokens_by_bucket"]))
+    rt = torch.load(Path(td) / "chunk_00000.pt", map_location="cpu")
     check("chunk round-trips for the pass",
-          len(torch.load(Path(td) / "chunk_00000.pt", map_location="cpu")) == 2)
+          len(rt) == 2 and rt[0]["ids"].dtype == torch.int32
+          and rt[0]["media_embeds"].shape[0] == 4 and rt[1]["media_embeds"] is None,
+          "ids + media_embeds, text rows carry none")
+    # A mismatched placeholder count must RAISE: splicing a misaligned row would attach every
+    # later media embedding to the wrong token, silently.
+    w2 = ChunkWriter(td, ["image"], tokens_per_chunk=10**9)
+    try:
+        w2.add(torch.full((1, 4), IMG, dtype=torch.long), torch.ones(1, 4, dtype=torch.bool),
+               "image", media_embeds=torch.zeros(3, cfg.hidden_size), media_token_id=IMG)
+        check("placeholder/embedding count mismatch raises", False)
+    except AssertionError as e:
+        check("placeholder/embedding count mismatch raises", "placeholders" in str(e))
 
 print("\nGATE " + ("PASS" if not fail else f"FAIL ({fail})"))
 sys.exit(1 if fail else 0)
