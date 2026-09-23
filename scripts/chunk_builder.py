@@ -33,7 +33,7 @@ from mimo_shards import ShardReader
 
 
 
-def _build_tower(factory, sd: dict, device, dtype):
+def _build_tower(factory, sd: dict, device, dtype, allow_missing=()):
     """Construct a tower with REAL init, load the checkpoint over it, zero what is absent.
 
     init_empty_weights leaves anything the checkpoint lacks on the meta device, and `.to(device)`
@@ -53,7 +53,8 @@ def _build_tower(factory, sd: dict, device, dtype):
     assert not unexpected, f"unexpected keys {unexpected[:4]}"
     buffers = set(dict(tower.named_buffers()))
     params = dict(tower.named_parameters())
-    bad = [k for k in missing if k not in buffers and not k.endswith(".bias")]
+    bad = [k for k in missing if k not in buffers and not k.endswith(".bias")
+           and k not in allow_missing]
     assert not bad, f"checkpoint is missing non-bias weights {bad[:4]} -- refusing to fabricate them"
     with torch.no_grad():
         for k in missing:
@@ -94,7 +95,13 @@ class Embedder:
             acfg = mod._as_namespace(self.cfg.audio_config)
             self._audio = _build_tower(
                 lambda: mod.MiMoAudioEncoder(acfg),
-                self.reader.load_module("audio_encoder.", self.dtype), self.device, self.dtype)
+                self.reader.load_module("audio_encoder.", self.dtype), self.device, self.dtype,
+                # STRUCTURALLY DEAD, not missing. `input_local_transformer` is only ever called
+                # as `inputs_embeds=...` (_apply_input_local_transformer), so its embedding table
+                # is never reached and the checkpoint rightly omits it. Allowlisted by name so
+                # the guard keeps its teeth for every other tensor -- a missing weight matrix
+                # stays fatal.
+                allow_missing={"input_local_transformer.embed_tokens.weight"})
             # The audio path needs the speech embedding table the model builds alongside it.
             sp = self.reader.load_module("speech_embeddings.", self.dtype)
             self._speech = _build_tower(lambda: mod._build_speech_embeddings(acfg),
