@@ -19,6 +19,27 @@ reproduce the averaging failure the whole pipeline is built to avoid: a budget t
 on eight domains and catastrophic on audio would win on the mean and destroy the model's one
 distinguishing capability.
 
+DEPLOYABILITY: A NON-UNIFORM BUDGET IS NOT PORTABLE
+---------------------------------------------------
+Checked against the checkpoint's own modeling code before relying on this: `n_routed_experts`
+is a SCALAR in config.json and is read globally --
+
+    self.experts = nn.ModuleList(
+        [MiMoV2MLP(config, ...) for _ in range(config.n_routed_experts)])    # line 192
+
+-- so every MoE layer is built with the same expert count. llama.cpp reads a single `n_expert`
+hparam as well. A per-layer budget therefore CANNOT be expressed in stock transformers, in vLLM,
+or in a GGUF; it requires patched modeling code and would only run on our own CUDA server.
+
+Padding the short layers back up to a uniform count would restore portability and throw away the
+entire point, since the Thor fit is a SIZE constraint.
+
+So this search produces a number to decide with, not automatically a checkpoint to ship:
+    * if the measured gain is small, take the uniform budget and stay portable;
+    * if it is large, the gain has to be weighed against losing GGUF and vLLM.
+`--verify-with-hope` and the reported `gain` exist so that decision is made on our own
+measurement rather than the ~5% carried over from the GLM project.
+
 WHY THE SEARCH RUNS IN REAP MODE
 --------------------------------
 Fitness is evaluated thousands of times. A HOPE QP per layer per candidate is far too expensive,
