@@ -1,0 +1,7 @@
+# Model weights and pass outputs never belong in git.
+artifacts/saliency/
+artifacts/*.pt
+logs/
+.venv/
+__pycache__/
+*.pyc
