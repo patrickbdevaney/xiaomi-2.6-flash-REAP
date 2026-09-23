@@ -1,11 +1,46 @@
-# Model weights and pass outputs never belong in git.
-artifacts/saliency/
-# `artifacts/*.pt` did NOT match artifacts/chunks/*.pt -- a leading-directory glob does not
-# recurse -- so `git add -A` committed 26 corpus chunks (1.6 GB each) into history before this
-# was noticed. Ignore the whole tree; nothing under artifacts/ belongs in git.
+# THIS REPO IS THE REAP CODE, NOTHING ELSE.
+# Model weights, calibration corpora and pass outputs live on HuggingFace, not in git.
+#
+# The previous rule was `artifacts/*.pt`, which does NOT match artifacts/chunks/*.pt -- a
+# leading-directory glob does not recurse -- so `git add -A` quietly committed corpus chunks
+# into history. Ignore the whole trees, and the extensions too, so a new subdirectory cannot
+# reintroduce the same hole.
+
+# Pass outputs, corpora, checkpoints
 artifacts/
-artifacts/*.pt
+chunks/
+saliency/
+outputs/
+checkpoints/
+
+# Model weights and any serialized tensor, wherever it lands
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+*.ggml
+*.onnx
+*.npz
+*.npy
+*.orphan
+*.superseded
+
+# Local model copies
+models/
+source/
+*.tar
+*.tar.gz
+
+# Logs, traces, scratch
 logs/
+*.log
+nohup.out
+
+# Python
 .venv/
+venv/
 __pycache__/
 *.pyc
+.ipynb_checkpoints/
+.pytest_cache/
