@@ -131,5 +131,24 @@ check("a healthy source is consumed once", len(list(BC.robust_rows("x", None, "t
       and calls["n"] == 1, f"called {calls['n']}x")
 BC.iter_rows = _orig
 
+# ---------------------------------------------------------------- 4. orphan chunks
+print("[4] chunks left by a build that died before its first checkpoint are set aside")
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    w = ChunkWriter(td, ["code"], tokens_per_chunk=8)
+    for _ in range(6):
+        i, v, bk, _, _ = _row("code")
+        w.add(i, v, "code")
+    w.flush()
+    n_before = len(list(td.glob("chunk_*.pt")))
+    check("the aborted build left chunks behind", n_before > 0, f"{n_before} files")
+    # no corpus_state.json was ever written -- exactly the crash-before-checkpoint case
+    check("no checkpoint exists", not (td / "corpus_state.json").exists())
+    w2 = ChunkWriter(td, ["code"], tokens_per_chunk=8)
+    w2.resume()
+    check("orphans renamed out of the way",
+          len(list(td.glob("chunk_*.pt"))) == 0 and len(list(td.glob("*.orphan"))) == n_before,
+          f"{len(list(td.glob('chunk_*.pt')))} left, {len(list(td.glob('*.orphan')))} orphaned")
+
 print("\n" + ("GATE FAIL: " + ", ".join(FAIL) if FAIL else "GATE PASS: all resilience guards fire"))
 sys.exit(1 if FAIL else 0)

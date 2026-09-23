@@ -233,6 +233,15 @@ class ChunkWriter:
         """Restore counters from corpus_state.json; return the buckets already finished."""
         f = self.out / "corpus_state.json"
         if not f.exists():
+            # No state, but chunks present: they are orphans from a build that died before its
+            # first checkpoint. Starting again at index 0 overwrites only as far as this run
+            # reaches, and anything past that would be read by the pass as real data.
+            orphans = sorted(self.out.glob("chunk_*.pt"))
+            for o in orphans:
+                o.rename(o.with_suffix(".pt.orphan"))
+            if orphans:
+                print(f"    set aside {len(orphans)} orphaned chunk(s) from an aborted build",
+                      flush=True)
             return []
         st = json.loads(f.read_text())
         self._n = int(st["next_chunk"])

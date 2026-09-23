@@ -136,6 +136,21 @@ def run(src, chunks_dir, out_dir, device="cuda", dtype=torch.bfloat16,
     buckets = json.loads((chunks_dir / "manifest.json").read_text())["buckets"]
     chunk_files = sorted(chunks_dir.glob("chunk_*.pt"))[: smoke_chunks or None]
     assert chunk_files, f"no chunks in {chunks_dir}"
+    # ORPHAN GUARD. A corpus build that dies before its first checkpoint leaves chunk files on
+    # disk that no manifest accounts for, and the next build -- starting again at index 0 --
+    # only overwrites the ones it happens to reach. Whatever is left is indistinguishable from
+    # real calibration data: it loads, it has a valid bucket label, and every invariant in
+    # verify_pass accepts it. Observed: a run left chunk_00013..18 behind from a previous
+    # aborted build. The manifest is written last and knows exactly how many chunks the corpus
+    # has, so a disagreement means stale files, and folding a stale chunk into the accumulators
+    # is unrecoverable.
+    declared = int(json.loads((chunks_dir / "manifest.json").read_text()).get("chunks", -1))
+    on_disk = len(sorted(chunks_dir.glob("chunk_*.pt")))
+    if not smoke_chunks and declared >= 0 and on_disk != declared:
+        raise RuntimeError(
+            f"{on_disk} chunk files on disk but the manifest declares {declared} -- there are "
+            f"stale chunks from an earlier aborted build in {chunks_dir}. Move them aside "
+            f"(they are renamed *.orphan by the builder) before calibrating.")
 
     MS.configure(buckets, n_layers=n_layers, n_experts=n_exp, device=device)
     MS.LAYER_INDEX.update({f"model.layers.{i}.mlp": i for i in range(n_layers)})
