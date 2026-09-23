@@ -143,9 +143,49 @@ VIDEO_SOURCES = [
     ("ShareGPTVideo/train_video_and_instruction", None, "train", 1.00),
 ]
 
-# Images: unchanged from GLM. These were already chosen for document/chart/GUI density, which is
-# what a coding agent actually looks at.
-IMAGE_SOURCES = MM_SOURCES
+# IMAGE SOURCES -- EVERY ENTRY MEASURED TO YIELD REAL IMAGES, 2026-09-23.
+#
+# The inherited `MM_SOURCES` list did not survive contact with the Hub: probed row by row,
+# NINE of its fifteen entries yielded ZERO usable images -- all seven
+# `nvidia/Nemotron-VLM-Dataset-v2` configs, `xlangai/aguvis-stage2` and
+# `ServiceNow/BigDocs-Bench:GUI-VQA` -- because those collections reference images BY PATH
+# instead of embedding them. That is 52% of the declared weight, and the build loop discarded
+# every such row silently. Worse, the two that died in the GUI/screenshot category are exactly
+# the ones a CODING AGENT needs: a model that cannot read a screenshot cannot drive a UI.
+#
+# Replacements were chosen by probing candidates, not by reading dataset cards. `WebSight`
+# earns its place twice over -- it is rendered web pages paired with the HTML that produced
+# them, which is simultaneously the screenshot-understanding and the code-generation signal.
+# `lmms-lab/ScreenSpot-Pro` was live but took 60 s to first row and is dropped for throughput;
+# `allenai/pixmo-cap`, `Salesforce/blip3-ocr-200m` and `osunlp/UGround-V1-Data` were probed and
+# rejected (path-only, path-only, gated).
+#
+# live_sources() re-probes all of these at run time, so this list rotting again costs a
+# renormalisation rather than a silently empty bucket.
+IMAGE_SOURCES = [
+    # -- GUI / screenshots: the coding-agent-relevant half, and what the dead sources cost us
+    ("HuggingFaceM4/WebSight",            "v0.2",                        "train", 0.12),
+    ("HuggingFaceM4/the_cauldron",        "websight",                    "train", 0.06),
+    ("agentsea/wave-ui-25k",              None,                          "train", 0.08),
+    ("rootsautomation/ScreenSpot",        None,                          "test",  0.05),
+    ("HuggingFaceM4/the_cauldron",        "screen2words",                "train", 0.05),
+    # -- charts, documents, OCR-heavy: the original list's strongest surviving members
+    ("HuggingFaceM4/the_cauldron",        "chartqa",                     "train", 0.10),
+    ("HuggingFaceM4/the_cauldron",        "docvqa",                      "train", 0.08),
+    ("HuggingFaceM4/the_cauldron",        "infographic_vqa",             "train", 0.05),
+    ("HuggingFaceM4/Docmatix",            "images",                      "train", 0.08),
+    ("allenai/pixmo-docs",                "charts",                      "train", 0.05),
+    # -- diagrams and science figures
+    ("HuggingFaceM4/the_cauldron",        "ai2d",                        "train", 0.05),
+    ("lmms-lab/LLaVA-OneVision-Data",     "ai2d(gpt4v)",                 "train", 0.03),
+    ("HuggingFaceM4/the_cauldron",        "tqa",                         "train", 0.03),
+    ("HuggingFaceM4/the_cauldron",        "scienceqa",                   "train", 0.03),
+    # -- general VQA, so the vision path is not calibrated purely on documents
+    ("HuggingFaceM4/the_cauldron",        "vqav2",                       "train", 0.06),
+    ("lmms-lab/LLaVA-OneVision-Data",     "CLEVR-Math(MathV360K)",       "train", 0.04),
+    ("lmms-lab/LLaVA-OneVision-Data",     "VisualWebInstruct(filtered)", "train", 0.04),
+]
+assert abs(sum(e[3] for e in IMAGE_SOURCES) - 1.0) < 1e-9, "image weights must sum to 1"
 
 # Added to corpus_spec.EXCLUDED rather than replacing it.
 EXCLUDED_OMNI = {

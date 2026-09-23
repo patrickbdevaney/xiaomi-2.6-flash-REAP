@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import time
 import sys
 from pathlib import Path
 
@@ -117,9 +118,109 @@ def iter_video_clips(frames_per_clip: int):
             buf = []
 
 
+MIN_BUCKET_FRAC = 0.50      # below this a bucket is a failed run, not a thin one
+WARN_BUCKET_FRAC = 0.95     # below this it is worth saying out loud
+SOURCE_RETRIES = 4
+
+
 def iter_rows(hid, cfgn, split):
     from datasets import load_dataset
     return load_dataset(hid, cfgn, split=split, streaming=True)
+
+
+def live_sources(kind, src_list, probe_rows: int = 12):
+    """Drop sources that cannot actually contribute, and renormalise the survivors' weights.
+
+    MEASURED 2026-09-23: nine of the fifteen configured image sources yielded ZERO usable
+    images -- every `nvidia/Nemotron-VLM-Dataset-v2` config plus `xlangai/aguvis-stage2` and
+    `ServiceNow/BigDocs-Bench`, together 52% of the declared image weight, all of them
+    path-only collections whose rows reference an image file rather than embedding one. The
+    build loop's `except ValueError: continue` swallowed every one of them silently, so the
+    bucket would have been served entirely by whichever source happened to be listed next.
+
+    Datasets rot, get gated, and change schema. Hard-coding the list that happened to work on
+    one afternoon is not robustness; probing at startup is. A dead source costs a few seconds
+    here instead of hours of a bucket that silently collects nothing.
+    """
+    live, dead = [], []
+    for entry in src_list:
+        hid, cfgn, split, w = entry[0], entry[1], entry[2], entry[3]
+        ok = 0
+        try:
+            for row in robust_rows(hid, cfgn, split, retries=1):
+                try:
+                    if kind == "image":
+                        row_image(row)
+                    elif kind == "audio":
+                        row_audio(row)
+                    ok += 1
+                    break
+                except ValueError:
+                    ok += 0
+                except Exception:
+                    ok += 0
+                probe_rows -= 1
+                if probe_rows <= 0:
+                    break
+        except Exception:
+            pass
+        (live if ok else dead).append(entry)
+        probe_rows = 12
+    for entry in dead:
+        print(f"    DEAD SOURCE ({kind}): {entry[0]}:{entry[1]} -- yields no usable media",
+              flush=True)
+    if dead:
+        lost = sum(e[3] for e in dead)
+        print(f"    {len(dead)}/{len(src_list)} {kind} sources dead, {lost:.0%} of declared "
+              f"weight; renormalising over the {len(live)} live ones", flush=True)
+    if not live:
+        raise RuntimeError(f"every {kind} source is dead -- cannot build the {kind} bucket")
+    return live
+
+
+def source_targets(src_list, want_total: int) -> list:
+    """Split a bucket's token target across its sources BY WEIGHT.
+
+    The weights in mimo_corpus_spec were being ignored entirely: the loop consumed sources in
+    order until the bucket target was met, so the first source supplied essentially the whole
+    bucket and every later one contributed nothing. That is the corpus-imbalance failure this
+    project has already measured once -- a bucket dominated by one source calibrates the router
+    on one distribution and the experts that serve the rest look dark.
+    """
+    tot = sum(e[3] for e in src_list) or 1.0
+    return [(e, max(1, int(want_total * e[3] / tot))) for e in src_list]
+
+
+def robust_rows(hid, cfgn, split, retries: int = SOURCE_RETRIES):
+    """Iterate a streaming source, surviving transient faults.
+
+    EVERY source here is an HTTP stream. Over the hours this stage runs, a connection reset, a
+    503 from the Hub or a decode error on one malformed row is not unlikely -- it is expected --
+    and any of them propagating out of the row loop kills a stage that has no partial credit.
+    The failure is retried from the start of the source with backoff; rows already consumed are
+    re-yielded, which costs duplicates but never loses the bucket. After `retries` attempts the
+    source is abandoned and the next one in the list takes over, because one dead source must
+    not be able to end the run either.
+
+    A source that dies is reported, not swallowed: a bucket quietly served by two of its five
+    sources is exactly the corpus-imbalance failure this project already paid for once.
+    """
+    for attempt in range(retries):
+        n = 0
+        try:
+            for row in iter_rows(hid, cfgn, split):
+                n += 1
+                yield row
+            return
+        except Exception as e:                      # noqa: BLE001 - any stream fault
+            wait = min(60, 5 * 2 ** attempt)
+            print(f"    ! {hid}:{cfgn or '-'} failed after {n:,} rows "
+                  f"({type(e).__name__}: {str(e)[:120]}); retry {attempt+1}/{retries} in {wait}s",
+                  flush=True)
+            if attempt == retries - 1:
+                print(f"    ! ABANDONING source {hid}:{cfgn or '-'}", flush=True)
+                return
+            time.sleep(wait)
 
 
 # ---------------------------------------------------------------- packing
@@ -212,7 +313,15 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
     for b in buckets:
         print(f"  {b:11} {want[b]:>12,}", flush=True)
 
+    already = W.resume()
+    if already:
+        print(f"resuming corpus build: {len(already)} buckets already collected "
+              f"({', '.join(already)})", flush=True)
+
     for bucket in buckets:
+        if bucket in already:
+            print(f"  {bucket:11} SKIPPED (checkpointed)", flush=True)
+            continue
         got = 0
         P = Packer(E, seq_len, eos)
 
@@ -244,14 +353,17 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
                     P.add(ids, pix=prep["pixel_values"], grid=prep["grid_thw"], kind="video")
                     emit()
             else:
-                for (hid, cfgn, split, _w) in src_list:
+                src_list = live_sources(bucket, src_list)
+                for (entry, sub) in source_targets(src_list, want[bucket]):
+                    hid, cfgn, split = entry[0], entry[1], entry[2]
                     if got >= want[bucket]:
                         break
-                    rows = iter_rows(hid, cfgn, split)
+                    stop_at = min(want[bucket], got + sub)
+                    rows = robust_rows(hid, cfgn, split)
                     if limit_per_source:
                         rows = itertools.islice(rows, limit_per_source)
                     for row in rows:
-                        if got >= want[bucket]:
+                        if got >= stop_at:
                             break
                         try:
                             if bucket == "image":
@@ -280,14 +392,16 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
                                               # downgraded to text -- see the module docstring
                         emit()
         else:
-            for (hid, cfgn, split, _w, text_fn) in SPEC.SOURCES[bucket]:
+            for (entry, sub) in source_targets(SPEC.SOURCES[bucket], want[bucket]):
+                hid, cfgn, split, text_fn = entry[0], entry[1], entry[2], entry[4]
                 if got >= want[bucket]:
                     break
-                rows = iter_rows(hid, cfgn, split)
+                stop_at = min(want[bucket], got + sub)
+                rows = robust_rows(hid, cfgn, split)
                 if limit_per_source:
                     rows = itertools.islice(rows, limit_per_source)
                 for row in rows:
-                    if got >= want[bucket]:
+                    if got >= stop_at:
                         break
                     try:
                         t = text_fn(row)
@@ -302,7 +416,23 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
                     P.add(ids)
                     emit()
         emit(force=True)
-        print(f"  {bucket:11} collected {got:,} / {want[bucket]:,} tokens", flush=True)
+        frac = got / max(1, want[bucket])
+        print(f"  {bucket:11} collected {got:,} / {want[bucket]:,} tokens ({frac:.0%})",
+              flush=True)
+        # UNDERFILL IS A QUALITY FAILURE, NOT A COSMETIC ONE. An under-served bucket leaves its
+        # experts under-routed, and an expert that is never routed to gets pruned arbitrarily
+        # rather than on evidence. Catching it here costs one bucket; catching it after the
+        # 34-hour pass costs the run.
+        if frac < MIN_BUCKET_FRAC:
+            raise RuntimeError(
+                f"bucket '{bucket}' collected {got:,} of {want[bucket]:,} tokens ({frac:.0%}), "
+                f"below the {MIN_BUCKET_FRAC:.0%} floor -- its sources are exhausted or failing. "
+                f"Calibrating on this corpus would prune the {bucket} experts on no evidence.")
+        if frac < WARN_BUCKET_FRAC:
+            print(f"    WARNING: {bucket} under target at {frac:.0%}", flush=True)
+        W.guard_bucket(bucket)
+        W.mark_done(bucket)
+        W.checkpoint(bucket)
 
     W.close()
     print(f"wrote {W.n_chunks} chunks to {out_dir}", flush=True)

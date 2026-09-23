@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
 import json
 import time
 from pathlib import Path
@@ -183,26 +184,35 @@ def run(src, chunks_dir, out_dir, device="cuda", dtype=torch.bfloat16,
                 torch.cuda.empty_cache()
         for st in states:
             st.pop("hs", None)          # free the activations before the next chunk loads
-        done.add(cf.name)
-        _dump_acc(out_dir)
-        state_path.write_text(json.dumps({"done": sorted(done)}, indent=1))
-        # EXPERT COVERAGE is the number that says whether the corpus is big enough. An expert
-        # never routed to has zero saliency and zero F mass, so REAP and HOPE both prune it
-        # ARBITRARILY rather than on evidence -- and with 256 experts and top-8 routing, a short
-        # corpus leaves most of them dark. This is reported every chunk so a thin corpus is
-        # visible early instead of at the end of a 34-hour pass.
-        # VERIFY BEFORE CHECKPOINTING. A broken invariant must stop the pass at chunk 3, not
-        # surface after 34 hours -- and HOPE's F cannot be recovered from a partial result, so a
-        # corrupted accumulator means starting over regardless. Cheap enough to run every chunk.
+        # VERIFY *BEFORE* CHECKPOINTING -- and it means before, which the previous ordering did
+        # not do: it dumped the accumulators and marked the chunk done, and only then verified.
+        # A corrupted accumulator was therefore persisted and its chunk recorded as folded in
+        # before anything checked it, so the resume path would load the corruption and SKIP the
+        # chunk that produced it, baking the fault in permanently and silently. Verifying first
+        # means a bad chunk leaves the last good checkpoint untouched and gets reprocessed.
+        # HOPE's F cannot be recovered from a partial result, so this ordering is the difference
+        # between losing one chunk and losing the run.
         status = VP.verify(MS.ACC, MS.FACC.sum, MS.FACC.cnt, buckets, cfg.num_experts_per_tok,
                            prev=prev_snap)
         prev_snap = VP.snapshot(MS.ACC)
-        (out_dir / "status.json").write_text(json.dumps(
-            {"chunks_done": len(done) + 1, "chunk": cf.name, **status}, indent=1))
+        # EXPERT COVERAGE is the number that says whether the corpus is big enough. An expert
+        # never routed to has zero saliency and zero F mass, so REAP and HOPE both prune it
+        # ARBITRARILY rather than on evidence -- and with 256 experts and top-8 routing, a short
+        # corpus leaves most of them dark. Reported every chunk so a thin corpus is visible early
+        # instead of at the end of a 34-hour pass.
+        _dump_acc(out_dir)
+        done.add(cf.name)
+        _atomic_write(state_path, json.dumps({"done": sorted(done)}, indent=1))
+        _atomic_write(out_dir / "status.json", json.dumps(
+            {"chunks_done": len(done), "chunk": cf.name, **status}, indent=1))
+        # MiMo layer 0 is DENSE, so a run restricted to it accumulates nothing and the
+        # coverage reduction is over an empty set. Never let the progress line be the thing
+        # that crashes a 34-hour pass.
         cov = [float((v["cnt"].sum(0) > 0).float().mean()) for v in MS.ACC.values()]
+        covtxt = (f"min {min(cov):.1%} mean {sum(cov)/len(cov):.1%}" if cov
+                  else "n/a (no MoE layer in range)")
         print(f"chunk {cf.name}: {len(states)} batches x {n_layers} layers "
-              f"in {time.time()-t0:.0f}s | expert coverage "
-              f"min {min(cov):.1%} mean {sum(cov)/len(cov):.1%}", flush=True)
+              f"in {time.time()-t0:.0f}s | expert coverage {covtxt}", flush=True)
         del states; gc.collect()
     return len(done)
 
@@ -220,10 +230,31 @@ def _rope(cfg, atype, hs, pos, device, dtype):
     return _ROPE_CACHE[key]
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
 def _dump_acc(out_dir: Path) -> None:
+    """Write the accumulators ATOMICALLY.
+
+    A 34-hour unattended run will eventually be interrupted mid-write. torch.save straight onto
+    the live path leaves a truncated accumulators.pt that pass_state.json still points at, and
+    the resume path then either throws or -- worse -- loads a partial tensor set. Writing to a
+    temp file and renaming makes the swap atomic on the same filesystem, so a crash at any
+    instant leaves either the previous complete checkpoint or the new one, never a torn file.
+    """
+    dst = out_dir / "accumulators.pt"
+    tmp = dst.with_suffix(".pt.tmp")
+    # .cpu() the F tensors too. Saving them as CUDA tensors and reloading with
+    # map_location="cpu" put FACC.sum on the host while update() kept feeding it device
+    # indices, so the FIRST chunk after any resume died in index_add_ on a device mismatch --
+    # the resume path was written but never once executed end to end.
     torch.save({"acc": {k: {kk: vv.cpu() for kk, vv in v.items()} for k, v in MS.ACC.items()},
-                "f_sum": MS.FACC.sum, "f_cnt": MS.FACC.cnt, "buckets": MS.BUCKETS},
-               out_dir / "accumulators.pt")
+                "f_sum": MS.FACC.sum.cpu(), "f_cnt": MS.FACC.cnt.cpu(),
+                "buckets": MS.BUCKETS}, tmp)
+    os.replace(tmp, dst)
 
 
 def _load_acc(out_dir: Path, device) -> None:
@@ -231,7 +262,8 @@ def _load_acc(out_dir: Path, device) -> None:
     MS.ACC.clear()
     for k, v in d["acc"].items():
         MS.ACC[k] = {kk: vv.to(device) for kk, vv in v.items()}
-    MS.FACC.sum, MS.FACC.cnt = d["f_sum"], d["f_cnt"]
+    MS.FACC.sum = d["f_sum"].to(MS.FACC.device)
+    MS.FACC.cnt = d["f_cnt"].to(MS.FACC.device)
 
 
 if __name__ == "__main__":

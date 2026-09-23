@@ -45,8 +45,16 @@ BUCKETS: list[str] = []
 
 
 def configure(buckets, n_layers: int, n_experts: int, device="cpu") -> None:
+    """Reset BOTH accumulators.
+
+    Resetting F while leaving ACC populated leaves the two describing different token sets, and
+    the pass's own invariant -- F's diagonal must equal sq/cnt -- then fails on a perfectly good
+    chunk. That is not hypothetical: it is what a second configure() in one process did, and it
+    took a resume gate to surface because production happens to configure exactly once.
+    """
     global FACC, BUCKETS
     BUCKETS = list(buckets)
+    ACC.clear()
     FACC = FAccumulator(n_layers, n_experts, device=device)
 
 

@@ -24,6 +24,7 @@ towers resident -- never the 48 decoder layers, which is what keeps this inside 
 from __future__ import annotations
 
 import gc
+import os
 import json
 from pathlib import Path
 
@@ -71,6 +72,16 @@ class Embedder:
         self.reader = ShardReader(src)
         w = self.reader.load_module("model.embed_tokens.", dtype)["weight"]
         self.embed = torch.nn.Embedding.from_pretrained(w.to(device), freeze=True)
+        del w
+        # Release the shard handles: safe_open keeps a live mmap, and pages faulted through a
+        # live mapping cannot be reclaimed, so a prefix scan over 65 shards pins cache the
+        # kernel may not evict. calib_pass releases after every layer; this path never did.
+        # MEASURED, and smaller than it looks: an A/B over the tower load (gate_shard_release)
+        # put the pinned amount at 7.2 GiB without the release vs 6.2 GiB with it, so this is
+        # worth ~1 GiB and is NOT the cause of the image-bucket OOM -- that hypothesis was
+        # tested here and refuted. Kept because it is correct and free, not because it is the fix.
+        # Safe because load_module copies every tensor out (copy=True / .clone()).
+        self.reader.release()
         self._visual = None
         self._audio = None
         self._speech = None
@@ -106,6 +117,9 @@ class Embedder:
             sp = self.reader.load_module("speech_embeddings.", self.dtype)
             self._speech = _build_tower(lambda: mod._build_speech_embeddings(acfg),
                                         sp, self.device, self.dtype) if sp else None
+        # Same reasoning as the constructor: the tower weights are copied into a real module,
+        # so the mappings that the prefix scan faulted in must not outlive this call.
+        self.reader.release()
         return self._visual if which == "visual" else self._audio
 
     @torch.no_grad()
@@ -152,6 +166,7 @@ class ChunkWriter:
         self._n = 0
         self._seen: dict[str, int] = {b: 0 for b in self.buckets}
         self._media_seen: dict[str, int] = {b: 0 for b in self.buckets}
+        self._done: list[str] = []
 
     def add(self, ids: torch.Tensor, valid: torch.Tensor, bucket: str,
             media_embeds: torch.Tensor | None = None, media_token_id: int | None = None) -> None:
@@ -185,10 +200,68 @@ class ChunkWriter:
     def flush(self) -> None:
         if not self._buf:
             return
-        torch.save(self._buf, self.out / f"chunk_{self._n:05d}.pt")
+        # Atomic, for the same reason the pass checkpoints atomically: a torn chunk_000NN.pt is
+        # indistinguishable from a good one until torch.load fails 20 hours into the pass.
+        dst = self.out / f"chunk_{self._n:05d}.pt"
+        tmp = dst.with_suffix(".pt.tmp")
+        torch.save(self._buf, tmp)
+        os.replace(tmp, dst)
         self._n += 1
         self._buf, self._tok = [], 0
         gc.collect()
+
+    # ---- resume -------------------------------------------------------------------------
+    # The corpus stage streams from nine source families and runs the towers over every image,
+    # audio clip and video clip. That is hours, and a transient network fault at hour three
+    # previously meant redoing hour one. Bucket boundaries are the natural checkpoint: a bucket
+    # is either fully collected or not started, so resuming at one cannot half-count a bucket.
+
+    def checkpoint(self, bucket: str) -> None:
+        """Flush at a bucket boundary and record enough to resume after it."""
+        self.flush()
+        state = {"next_chunk": self._n, "seen": self._seen,
+                 "media_seen": self._media_seen, "done_buckets": self._done}
+        tmp = self.out / "corpus_state.json.tmp"
+        tmp.write_text(json.dumps(state, indent=1))
+        os.replace(tmp, self.out / "corpus_state.json")
+
+    def mark_done(self, bucket: str) -> None:
+        if bucket not in self._done:
+            self._done.append(bucket)
+
+    def resume(self) -> list:
+        """Restore counters from corpus_state.json; return the buckets already finished."""
+        f = self.out / "corpus_state.json"
+        if not f.exists():
+            return []
+        st = json.loads(f.read_text())
+        self._n = int(st["next_chunk"])
+        self._seen.update(st.get("seen", {}))
+        self._media_seen.update(st.get("media_seen", {}))
+        self._done = list(st.get("done_buckets", []))
+        # Any chunk index at or beyond the checkpoint is from an aborted bucket that will now be
+        # recollected. Leaving it would feed the pass duplicate, half-written data that every
+        # invariant in verify_pass would happily accept.
+        for stale in sorted(self.out.glob("chunk_*.pt")):
+            if int(stale.stem.split("_")[1]) >= self._n:
+                stale.rename(stale.with_suffix(".pt.superseded"))
+        for t in self.out.glob("*.tmp"):
+            t.unlink()
+        return list(self._done)
+
+    def guard_bucket(self, bucket: str) -> None:
+        """Fail fast on a media bucket that collected no media.
+
+        close() already refuses this, but close() runs after every bucket -- i.e. hours after
+        the fault, having already paid for the rest of the corpus. Checking at the boundary
+        surfaces it as soon as it is knowable.
+        """
+        if bucket in ("image", "audio", "video") and self._seen.get(bucket, 0) \
+                and not self._media_seen.get(bucket, 0):
+            raise RuntimeError(
+                f"bucket '{bucket}' collected {self._seen[bucket]} tokens but NONE came from "
+                f"real media -- it would calibrate the {bucket} experts on text and guarantee "
+                f"they are pruned first. Refusing to continue.")
 
     def close(self) -> None:
         self.flush()

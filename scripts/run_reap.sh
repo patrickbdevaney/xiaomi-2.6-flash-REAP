@@ -33,7 +33,21 @@ if [ "$AVAIL" -lt "$MIN_AVAIL_MB" ]; then
   exit 1
 fi
 
+# MEMORY TRACE. Two runs were OOM-killed with nothing in the log to say where the memory went,
+# because the kernel's own accounting does not see the driver pool and systemd's cgroup peak
+# (7.0 then 10.7 GiB on a 122 GiB box) is not the number that matters. A 5-second sample costs
+# nothing and turns the next failure into a trajectory instead of a guess.
+( while true; do
+    echo "$(date +%H:%M:%S) avail=$(awk '/MemAvailable:/{print int($2/1024)}' /proc/meminfo)MB" \
+         "cached=$(awk '/^Cached:/{print int($2/1024)}' /proc/meminfo)MB" \
+         "stage=$(cat logs/.stage 2>/dev/null)"
+    sleep 5
+  done ) >> logs/reap_mem.log 2>&1 &
+MEMPID=$!
+trap 'kill $MEMPID 2>/dev/null' EXIT
+
 if [ ! -f artifacts/chunks/manifest.json ]; then
+  echo stage1-corpus > logs/.stage
   say "STAGE 1 build corpus"
   "$PY" scripts/build_corpus.py --out artifacts/chunks --total-tokens "$TOTAL" \
       --seq-len "$SEQ" --tokens-per-chunk 2000000 >> "$LOG" 2>&1 \
@@ -43,6 +57,7 @@ else
   say "STAGE 1 SKIPPED -- artifacts/chunks/manifest.json already exists"
 fi
 
+echo stage2-pass > logs/.stage
 say "STAGE 2 calibration pass (48 layers)"
 "$PY" scripts/calib_pass.py --chunks artifacts/chunks --out artifacts/saliency >> "$LOG" 2>&1
 RC=$?
