@@ -32,6 +32,7 @@ from pathlib import Path
 import torch
 
 import mimo_saliency as MS
+import verify_pass as VP
 from hope_fmatrix import FAccumulator
 from mimo_shards import ShardReader
 
@@ -116,6 +117,21 @@ def run(src, chunks_dir, out_dir, device="cuda", dtype=torch.bfloat16,
         seen += 1
     assert seen == n_exp, f"config says {n_exp} experts, checkpoint has {seen}"
 
+    # The embedding table, and only the table: chunks carry token ids plus already-towered media
+    # embeddings, so the pass never loads the vision or audio towers. 1.25 GB resident.
+    emb_w = ShardReader(src).load_module("model.embed_tokens.", dtype)["weight"].to(device)
+
+    def to_embeds(st):
+        e = torch.nn.functional.embedding(st["ids"].to(device).long(), emb_w)
+        me = st.get("media_embeds")
+        if me is not None:
+            mask = st["ids"].to(device).eq(st["media_token_id"])
+            assert int(mask.sum()) == me.shape[0], (
+                f"{int(mask.sum())} placeholders but {me.shape[0]} media embeddings in "
+                f"{st['bucket']} -- refusing to splice a misaligned row")
+            e[mask] = me.to(device, dtype)
+        return e
+
     buckets = json.loads((chunks_dir / "manifest.json").read_text())["buckets"]
     chunk_files = sorted(chunks_dir.glob("chunk_*.pt"))[: smoke_chunks or None]
     assert chunk_files, f"no chunks in {chunks_dir}"
@@ -124,6 +140,7 @@ def run(src, chunks_dir, out_dir, device="cuda", dtype=torch.bfloat16,
     MS.LAYER_INDEX.update({f"model.layers.{i}.mlp": i for i in range(n_layers)})
     MS.patch(_modeling(cfg))
 
+    prev_snap = None
     state_path = out_dir / "pass_state.json"
     done = set(json.loads(state_path.read_text())["done"]) if state_path.exists() else set()
     if done:
@@ -135,7 +152,7 @@ def run(src, chunks_dir, out_dir, device="cuda", dtype=torch.bfloat16,
             continue
         t0 = time.time()
         states = torch.load(cf, map_location="cpu")
-        S = states[0]["embeds"].shape[1]
+        S = states[0]["ids"].shape[1]
         if cfg._attn_implementation == "eager" and S > 2048:
             raise RuntimeError(
                 f"refusing to run eager attention at S={S}: the score matrix is "
@@ -145,23 +162,27 @@ def run(src, chunks_dir, out_dir, device="cuda", dtype=torch.bfloat16,
         for li in range(n_layers):
             layer = build_layer(cfg, li, reader, dtype).to(device)
             atype = layer.attention_type
-            pos = torch.arange(states[0]["embeds"].shape[1], device=device)[None]
+            pos = torch.arange(S, device=device)[None]
             with torch.no_grad():
                 for st in states:
                     MS.CTX.update({"layer": f"model.layers.{li}.mlp",
                                    "bucket": buckets.index(st["bucket"]),
                                    "valid": st["valid"].to(device).reshape(-1)})
-                    hs = st["embeds"].to(device, dtype)
+                    # Layer 0 embeds from ids; every later layer consumes the previous
+                    # layer's output, which is carried in `hs`.
+                    hs = (to_embeds(st) if li == 0 else st["hs"].to(device, dtype))
                     pe = _rope(cfg, atype, hs, pos, device, dtype)
                     out = layer(hs, attention_mask=masks[atype], position_ids=pos,
                                 position_embeddings=pe)
-                    st["embeds"] = out.to("cpu", torch.bfloat16)
+                    st["hs"] = out.to("cpu", torch.bfloat16)
                     MS.CTX["valid"] = None
                     del hs, out
             del layer
             reader.release(); gc.collect()
             if device == "cuda":
                 torch.cuda.empty_cache()
+        for st in states:
+            st.pop("hs", None)          # free the activations before the next chunk loads
         done.add(cf.name)
         _dump_acc(out_dir)
         state_path.write_text(json.dumps({"done": sorted(done)}, indent=1))
@@ -170,6 +191,14 @@ def run(src, chunks_dir, out_dir, device="cuda", dtype=torch.bfloat16,
         # ARBITRARILY rather than on evidence -- and with 256 experts and top-8 routing, a short
         # corpus leaves most of them dark. This is reported every chunk so a thin corpus is
         # visible early instead of at the end of a 34-hour pass.
+        # VERIFY BEFORE CHECKPOINTING. A broken invariant must stop the pass at chunk 3, not
+        # surface after 34 hours -- and HOPE's F cannot be recovered from a partial result, so a
+        # corrupted accumulator means starting over regardless. Cheap enough to run every chunk.
+        status = VP.verify(MS.ACC, MS.FACC.sum, MS.FACC.cnt, buckets, cfg.num_experts_per_tok,
+                           prev=prev_snap)
+        prev_snap = VP.snapshot(MS.ACC)
+        (out_dir / "status.json").write_text(json.dumps(
+            {"chunks_done": len(done) + 1, "chunk": cf.name, **status}, indent=1))
         cov = [float((v["cnt"].sum(0) > 0).float().mean()) for v in MS.ACC.values()]
         print(f"chunk {cf.name}: {len(states)} batches x {n_layers} layers "
               f"in {time.time()-t0:.0f}s | expert coverage "

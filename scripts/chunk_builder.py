@@ -153,12 +153,28 @@ class ChunkWriter:
         self._seen: dict[str, int] = {b: 0 for b in self.buckets}
         self._media_seen: dict[str, int] = {b: 0 for b in self.buckets}
 
-    def add(self, embeds: torch.Tensor, valid: torch.Tensor, bucket: str,
-            had_media: bool = False) -> None:
+    def add(self, ids: torch.Tensor, valid: torch.Tensor, bucket: str,
+            media_embeds: torch.Tensor | None = None, media_token_id: int | None = None) -> None:
+        """Store TOKEN IDS plus already-towered media embeddings, not inputs_embeds.
+
+        50M tokens of bf16 inputs_embeds is 410 GB against 324 GB free -- the corpus would not
+        fit on the box. Ids are 4 bytes a token instead of 8,192, and only the media rows need
+        their embeddings carried (49 GB at a 12% media share). The towers still run exactly
+        ONCE, here, which was the reason for pre-embedding in the first place; the pass does the
+        embedding-table lookup, which is a gather against a 1.25 GB table.
+        """
         assert bucket in self.buckets, f"unknown bucket {bucket}"
-        assert embeds.shape[:2] == valid.shape, f"{embeds.shape} vs {valid.shape}"
-        self._buf.append({"embeds": embeds.to("cpu", torch.bfloat16),
-                          "valid": valid.cpu(), "bucket": bucket})
+        assert ids.shape == valid.shape, f"{ids.shape} vs {valid.shape}"
+        had_media = media_embeds is not None and media_embeds.numel() > 0
+        if had_media:
+            n_slot = int((ids == media_token_id).sum())
+            assert n_slot == media_embeds.shape[0], (
+                f"{n_slot} media placeholders but {media_embeds.shape[0]} embeddings")
+        self._buf.append({"ids": ids.to(torch.int32).cpu(), "valid": valid.cpu(),
+                          "bucket": bucket,
+                          "media_embeds": media_embeds.to("cpu", torch.bfloat16)
+                          if had_media else None,
+                          "media_token_id": media_token_id if had_media else None})
         n = int(valid.sum().item())
         self._tok += n
         self._seen[bucket] += n

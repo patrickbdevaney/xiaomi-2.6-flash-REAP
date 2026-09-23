@@ -158,22 +158,35 @@ class Packer:
             self.kind = kind
 
     def flush(self):
-        """-> (embeds [1,S,H], valid [1,S], had_media) or None."""
+        """-> (ids [1,S], valid [1,S], media_embeds or None, media_token_id) or None.
+
+        The TOWERS RUN HERE and their output is returned; the pass only ever does a table
+        lookup and a positional splice. That keeps the towers a once-per-corpus cost while
+        storing 4 bytes a text token instead of 8,192.
+        """
         if not self.ids:
             return None
         n = min(len(self.ids), self.S)
         ids = torch.tensor([self.ids[:n] + [self.eos] * (self.S - n)], dtype=torch.long)
         valid = torch.zeros(1, self.S, dtype=torch.bool); valid[0, :n] = True
-        media = {}
+        me, tokid = None, None
         if self.pix:
-            media[self.kind] = {"pixel_values": torch.cat(self.pix, 0),
-                                "grid_thw": torch.cat(self.grid, 0)}
-        if self.audio:
-            media["audio"] = {"audio_embeds": torch.cat(self.audio, 0)}
-        had = bool(media)
-        emb = self.E.embed_batch(ids, media=media or None)
+            me = self.E._lazy("visual")(
+                pixel_values=torch.cat(self.pix, 0).to(self.E.device),
+                grid_thw=torch.cat(self.grid, 0).to(self.E.device))
+            tokid = self.E.ids[self.kind]
+        elif self.audio:
+            me = torch.cat(self.audio, 0)
+            tokid = self.E.ids["audio"]
+        if me is not None:
+            n_slot = int((ids == tokid).sum())
+            # Truncation can cut a media row's placeholders; drop the orphaned tail rather than
+            # splice a misaligned one, which would silently attach every later patch to the
+            # wrong token.
+            me = me[:n_slot]
+            assert me.shape[0] == n_slot, f"{n_slot} placeholders, {me.shape[0]} embeddings"
         self.reset()
-        return emb, valid, had
+        return ids, valid, me, tokid
 
 
 # ---------------------------------------------------------------- the build
@@ -210,8 +223,8 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
             r = P.flush()
             if r is None:
                 return
-            emb, valid, had = r
-            W.add(emb, valid, bucket, had_media=had)
+            ids, valid, me, tokid = r
+            W.add(ids, valid, bucket, media_embeds=me, media_token_id=tokid)
             got += int(valid.sum())
 
         if bucket in ("image", "audio", "video"):
