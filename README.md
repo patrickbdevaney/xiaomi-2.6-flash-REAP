@@ -56,7 +56,10 @@ scripts/mimo_saliency.py       patches MiMoV2MoE.moe; all criteria + F in ONE pa
 scripts/mimo_corpus_spec.py    omni calibration corpus (licence-verified, permissive only)
 scripts/corpus_spec.py         VENDORED text buckets; the GLM repo's copy is authoritative
 scripts/pull_mimo.sh           detached 177.8 GB checkpoint pull, with verification
-scripts/gate_*.py              CPU gates, seconds, no checkpoint — run them first
+scripts/calib_pass.py          layer-sequential sweep; one layer resident, resumable
+scripts/chunk_builder.py       towers + embedding table -> bucketed chunks of inputs_embeds
+scripts/mimo_shards.py         streaming reader; MXFP4 + FP8-block dequant
+scripts/gate_*.py              gates — the first four need no GPU; run them first
 ```
 
 ## Gates
@@ -80,7 +83,9 @@ F-matrix silently deflated every entry under a valid-mask until `F[k,k] == sq/cn
 - [x] HOPE F-matrix + solver, gated
 - [x] Saliency patcher, gated bit-identical against the upstream forward
 - [x] Omni corpus split specified
-- [ ] Calibration-pass driver (bucketed batching, audio/video through the processor)
+- [x] Calibration-pass driver, GPU-smoked at S=4096 (~6% instrumentation overhead)
+- [x] Chunk builder: embedding table + towers, with the text-only-media-bucket guard
+- [ ] Audio and video loaders (the image path is gated end-to-end; audio needs the audio_tokenizer)
 - [x] Ballast share decided: **0.15 → 0.20**, out of science (0.10→0.07) and finance (0.06→0.04)
 - [ ] Calibration pass → HOPE QP → per-layer budget search → Router KD
 - [ ] CUDA server (48 layers, 9 full + 39 SWA, GQA with per-type KV head counts, no shared expert)
