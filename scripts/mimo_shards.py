@@ -83,8 +83,16 @@ class ShardReader:
     def get(self, name: str) -> torch.Tensor:
         return self._f(self.map[name]).get_tensor(name)
 
+    @staticmethod
+    def _norm(prefix: str) -> str:
+        """Force a trailing dot. `model.layers.1` is a prefix of `model.layers.11`, so a bare
+        prefix would silently fold eleven other layers' tensors into layer 1's state dict --
+        shapes would still match, load_state_dict would still succeed, and every statistic in the
+        run would be wrong."""
+        return prefix if prefix.endswith(".") else prefix + "."
+
     def names_for(self, prefix: str) -> list[str]:
-        return [k for k in self.map if k.startswith(prefix)]
+        return [k for k in self.map if k.startswith(self._norm(prefix))]
 
     def release(self) -> None:
         """Close every shard handle.
@@ -99,6 +107,7 @@ class ShardReader:
     def load_module(self, prefix: str, dtype=torch.bfloat16) -> dict[str, torch.Tensor]:
         """{relative_name: tensor}, with both quantised formats resolved."""
         out: dict[str, torch.Tensor] = {}
+        prefix = self._norm(prefix)
         names = self.names_for(prefix)
         aux = {n for n in names if n.endswith(("weight_scale", "weight_scale_inv"))}
         for n in names:
