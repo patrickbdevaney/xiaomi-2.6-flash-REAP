@@ -78,6 +78,32 @@ def main():
     check("the order-independence test can see an order-dependent sum", rel_bad > 1e-9,
           f"{rel_bad:.2e}")
 
+    # ---- the stage 2B seam: a chunk appended AFTER the cache was written ----
+    # video_topup adds chunk 27 and relabels the cache. If chunk_order could not place a chunk
+    # the cache does not know, the new chunk would sort as an unknown bucket and the fold would
+    # either skip it or order it last -- and this seam runs exactly once, unattended, 30 hours in.
+    import tempfile, pathlib, torch as _t
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        for i, b in enumerate(["agentic", "code", "video"]):
+            _t.save([{"bucket": b, "ids": _t.zeros(1, 4, dtype=_t.long),
+                      "valid": _t.ones(1, 4, dtype=_t.bool)}], td / f"chunk_{i:05d}.pt")
+        (td / "chunk_buckets.json").write_text(json.dumps(
+            {"chunk_00000.pt": "agentic", "chunk_00001.pt": "code", "chunk_00002.pt": "video"}))
+        # the appended chunk, absent from the cache
+        _t.save([{"bucket": "video", "ids": _t.zeros(1, 4, dtype=_t.long),
+                  "valid": _t.ones(1, 4, dtype=_t.bool)}], td / "chunk_00003.pt")
+        files2 = sorted(td.glob("chunk_*.pt"))
+        order2 = chunk_order(td, files2)
+        cache2 = json.loads((td / "chunk_buckets.json").read_text())
+        check("an appended chunk is placed even though the cache predates it",
+              len(order2) == 4 and set(order2) == set(files2), f"{len(order2)} chunks ordered")
+        check("its bucket is read from the chunk itself and cached",
+              cache2.get("chunk_00003.pt") == "video", f"cached as {cache2.get('chunk_00003.pt')!r}")
+        seq = [cache2[f.name] for f in order2]
+        check("the appended video chunk sorts as a second video chunk, not first",
+              seq.index("video") < len(seq) - 1 and seq[-1] == "video", f"order {seq}")
+
     print(("GATE FAIL: " + ", ".join(FAIL)) if FAIL else "GATE PASS")
     return 1 if FAIL else 0
 
