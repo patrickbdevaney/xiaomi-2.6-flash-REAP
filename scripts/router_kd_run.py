@@ -124,6 +124,20 @@ def expert_outputs(experts, hid, cand, dtype):
     return out.detach()
 
 
+def _rss_mb() -> int:
+    """This process's resident size. Reported per layer because stage 6 builds 47 layers of
+    ~12 GiB each and frees them; if that free ever stops working the run dies at layer N, and a
+    growth trend is the only thing that shows it before it does."""
+    try:
+        with open("/proc/self/status") as f:
+            for ln in f:
+                if ln.startswith("VmRSS:"):
+                    return int(ln.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
+
+
 def _avail_mb() -> int:
     with open("/proc/meminfo") as f:
         for ln in f:
@@ -333,13 +347,21 @@ def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16
             # the baseline loss is exactly zero and every gradient step can only move away from
             # it. Falling back costs nothing and removes a whole class of silent regression.
             if not (r["last"] < r["baseline"]):
+                # Record what training WOULD have done before discarding it: on a near-zero
+                # baseline the optimiser can be catastrophically worse (measured: -743770390%
+                # at layer 4), and that number is the justification for this fallback existing.
+                r["rejected_last"] = r["last"]
+                r["rejected_improvement"] = r["improvement"]
                 r["w"], r["kept_teacher"] = W[keep].float().cpu(), True
                 r["last"] = r["baseline"]
+                r["improvement"] = 0.0      # the shipped router IS the baseline, by definition
             trained[name] = {"weight": r["w"].cpu(), "bias": r["b"].cpu(), "keep": keep.cpu()}
             res["layers"][name] = {k: r[k] for k in
                                    ("baseline", "first", "last", "boundary", "improvement")}
             res["layers"][name]["tokens"] = n
             res["layers"][name]["kept_teacher"] = bool(r.get("kept_teacher", False))
+            if r.get("kept_teacher"):
+                res["layers"][name]["rejected_improvement"] = r["rejected_improvement"]
             tmp = trained_path.with_suffix(".tmp")
             torch.save(trained, tmp); tmp.replace(trained_path)
             tmp2 = state_path.with_suffix(".tmp")
@@ -347,7 +369,7 @@ def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16
             print(f"  layer {li:>2} kept {len(keep):>3}/{n_exp}  loss {r['baseline']:.4e} -> "
                   f"{r['last']:.4e} ({r['improvement']:+6.1%})  boundary {r['boundary']:.1%}  "
                   f"n={n}{'  [kept teacher]' if r.get('kept_teacher') else ''}  "
-                  f"[{(time.time()-t0)/60:.1f}m]", flush=True)
+                  f"rss {_rss_mb()/1024:.1f}G  [{(time.time()-t0)/60:.1f}m]", flush=True)
             del hid, cand, cand_out
         del layer
         CAP["hid"] = None

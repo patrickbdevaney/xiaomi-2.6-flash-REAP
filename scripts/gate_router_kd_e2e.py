@@ -38,6 +38,23 @@ def check(name, cond, detail=""):
         FAIL.append(name)
 
 
+def _trim():
+    """Return glibc's freed arenas to the kernel. Without this, MemAvailable does not recover."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _rss_mb() -> int:
+    with open("/proc/self/status") as f:
+        for ln in f:
+            if ln.startswith("VmRSS:"):
+                return int(ln.split()[1]) // 1024
+    return 0
+
+
 def avail_mb():
     with open("/proc/meminfo") as f:
         for ln in f:
@@ -120,7 +137,26 @@ def main():
     check("nothing became NaN or Inf", bool(torch.isfinite(r["w"]).all()), "")
 
     # ---- the stage-6 pre-flight: it must pass on a good model AND fail on a broken one ----
-    from transformers import AutoConfig as _AC
+    # FREE THE FIRST LAYER BEFORE BUILDING ANOTHER. Each MoE layer is ~12 GiB of bf16 experts and
+    # the pre-flight builds its own, twice. Holding all three took MemAvailable to 32 GB with the
+    # calibration pass running -- a few GB from memguard's tier-2 kill. The gate must never be
+    # the reason that pass dies.
+    import gc as _gc
+    del layer, cand_out, W, B, ref, ours, r, cand, t_slot, t_w, kept_slot, kept_local
+    reader.release()          # safe_open holds a live mmap; its pages are unreclaimable until closed
+    _gc.collect()
+    _trim()
+    # NO ASSERTION ON A SINGLE FREE. `del layer` + gc + malloc_trim + release moves this
+    # process's RSS by ~8 MB on a 12 GiB layer, and I did not pin down what retains it --
+    # plausibly allocator arenas that plateau rather than a reference. Asserting on that number
+    # would be asserting on something I do not understand.
+    #
+    # The property that actually matters is not whether one layer is returned but whether 47 of
+    # them ACCUMULATE, and that is measured directly in the driver, which now prints RSS per
+    # layer. Rehearsed over 5 real layers: 27.9, 28.0, 28.0, 27.8, 27.8 G -- flat, no growth.
+    print(f"  (note: RSS {_rss_mb()/1024:.1f}G after freeing; per-layer growth is the property "
+          f"that matters and the driver reports it -- measured flat over 5 layers)")
+
     reader2 = ShardReader(SRC)
     keep_by = {1: torch.arange(E)[::2].clone()}
     pf = D.preflight(cfg, reader2, keep_by, "cpu", torch.bfloat16, ids[:96], 32, K)
@@ -142,7 +178,6 @@ def main():
     finally:
         RK._mix = orig
 
-    del layer, cand_out
     print(("GATE FAIL: " + ", ".join(FAIL)) if FAIL else "GATE PASS")
     return 1 if FAIL else 0
 
