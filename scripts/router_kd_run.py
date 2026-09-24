@@ -124,6 +124,80 @@ def expert_outputs(experts, hid, cand, dtype):
     return out.detach()
 
 
+def _avail_mb() -> int:
+    with open("/proc/meminfo") as f:
+        for ln in f:
+            if ln.startswith("MemAvailable:"):
+                return int(ln.split()[1]) // 1024
+    return 0
+
+
+def preflight(cfg, reader, keep_by_layer, device, dtype, ids, kept_cand, top_k,
+              tol: float = 2e-2) -> dict:
+    """Run ONE MoE layer on the real device before committing to all 47.
+
+    Stage 6 is ~31 hours into the run and its GPU path cannot be rehearsed beforehand without
+    competing for memory with the calibration pass -- the contention that has OOM-killed this box
+    four times. So the rehearsal happens here instead, at the moment the GPU is free and before
+    any of the expensive work: build one real layer, assemble the teacher mixture, and check it
+    against the layer's OWN MoE forward.
+
+    That one equality exercises the router formula, the candidate slots, the per-expert
+    evaluation and the gather together, on the real device in the real dtype. It also takes two
+    optimiser steps, because the defect that actually bit here was an autograd graph retained
+    through the frozen experts: it raised only on the SECOND step, and only on real weights.
+
+    Two minutes, and the alternative is discovering it after the stage has run for hours.
+    """
+    li = min(keep_by_layer)
+    t0 = time.time()
+    layer = build_layer(cfg, li, reader, dtype).to(device)
+    if not hasattr(layer.mlp, "experts"):
+        del layer
+        raise SystemExit(f"preflight: layer {li} has no experts; the mask indexes a dense layer")
+    emb = reader.get("model.embed_tokens.weight")
+    hid = torch.nn.functional.embedding(ids.to(emb.device), emb).to(device, dtype)
+    del emb
+    reader.release()
+
+    W = layer.mlp.gate.weight.detach()
+    B = layer.mlp.gate.e_score_correction_bias.detach()
+    E = W.shape[0]
+    all_keep = torch.arange(E, device=device)
+    cand, t_slot, t_w, kept_slot, kept_local = candidates(hid, W, B, all_keep, top_k, kept_cand)
+    cand_out = expert_outputs(layer.mlp.experts, hid, cand, dtype)
+    with torch.no_grad():
+        ref = layer.mlp(hid.unsqueeze(0)).squeeze(0).float()
+    ours = RK._mix(t_w, t_slot, cand_out).float()
+    rel = float((ours - ref).norm() / ref.norm().clamp(min=1e-30))
+    if not (rel < tol):
+        del layer, cand_out
+        raise SystemExit(
+            f"PREFLIGHT FAILED: the teacher mixture disagrees with layer {li}'s own MoE output "
+            f"by {rel:.3e} (tolerance {tol:.0e}). The router formula, the candidate slots or the "
+            f"expert gather is wrong on this device, and every layer would be trained against a "
+            f"teacher that is not the model. Nothing has been written.")
+
+    keep = keep_by_layer[li].to(device)
+    cand, t_slot, t_w, kept_slot, kept_local = candidates(hid, W, B, keep, top_k, kept_cand)
+    cand_out = expert_outputs(layer.mlp.experts, hid, cand, dtype)
+    try:
+        RK.fit_layer(cand_out, t_slot, t_w, hid, W, B, keep, kept_slot, kept_local, top_k,
+                     steps=2, lr=1e-4, batch=None)
+    except RuntimeError as e:
+        del layer, cand_out
+        raise SystemExit(
+            f"PREFLIGHT FAILED: the optimiser could not take two steps on real weights on "
+            f"{device} ({e}). This is the shape of a retained autograd graph through the frozen "
+            f"experts, which raises only on the second step. Nothing has been written.")
+    mb_per_token = cand_out.numel() * cand_out.element_size() / 2 ** 20 / hid.shape[0]
+    del layer, cand_out, hid
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return {"layer": li, "rel": rel, "mb_per_token": mb_per_token, "secs": time.time() - t0}
+
+
 def load_keep(mask_path: Path, n_exp: int) -> dict[int, torch.Tensor]:
     d = json.loads(Path(mask_path).read_text())
     mask = d.get("mask", d)
@@ -146,7 +220,7 @@ def _busy() -> str | None:
 
 def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16,
         tokens=2048, kept_cand=32, steps=300, lr=1e-3, batch=512, chunk_index=0, seed=0,
-        max_layers=None, max_batches=None, max_seq=None):
+        max_layers=None, max_batches=None, max_seq=None, skip_preflight=False):
     from transformers import AutoConfig
     src, out_dir = Path(src), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -181,6 +255,26 @@ def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16
     res = json.loads(state_path.read_text()) if state_path.exists() else {"layers": {}}
     trained_path = out_dir / "router_kd.pt"
     trained = torch.load(trained_path, map_location="cpu") if trained_path.exists() else {}
+
+    if not skip_preflight:
+        pf = preflight(cfg, reader, keep_by_layer, device, dtype,
+                       states[0]["ids"][0, :96], kept_cand, K)
+        # The candidate tensor is the one allocation in this stage that scales with the token
+        # budget, and it is measured here rather than predicted: [tokens, K+kept_cand, hidden].
+        # Refusing now costs nothing; discovering it at token 2048 costs the calibration pass,
+        # because on this box an over-allocation is charged to no cgroup and killed by nobody.
+        proj_mb = pf["mb_per_token"] * tokens
+        avail_mb = _avail_mb()
+        if proj_mb > 0.25 * avail_mb:
+            raise SystemExit(
+                f"PREFLIGHT REFUSED: the candidate tensor would be {proj_mb:.0f}MB at "
+                f"--tokens {tokens}, more than a quarter of the {avail_mb}MB available. "
+                f"Re-run with --tokens {int(tokens * 0.25 * avail_mb / max(proj_mb, 1)):d} "
+                f"or fewer, or --kept-candidates below {kept_cand}. Nothing has been written.")
+        print(f"preflight OK on layer {pf['layer']}: teacher mixture matches the real MoE to "
+              f"{pf['rel']:.2e}, two optimiser steps taken; candidate tensor projects to "
+              f"{proj_mb:.0f}MB at {tokens} tokens ({100*proj_mb/max(avail_mb,1):.1f}% of "
+              f"{avail_mb}MB available) [{pf['secs']:.0f}s]", flush=True)
 
     mod = _modeling(cfg)
     emb = None
@@ -296,6 +390,8 @@ def main():
                     help="rehearsal only: stream only this many batches of the chunk")
     ap.add_argument("--max-seq", type=int, default=None,
                     help="rehearsal only: truncate each sequence to this length")
+    ap.add_argument("--skip-preflight", action="store_true",
+                    help="skip the one-layer device check (not recommended)")
     ap.add_argument("--force", action="store_true",
                     help="run even while the calibration pass holds the GPU")
     a = ap.parse_args()
@@ -307,7 +403,7 @@ def main():
     run(a.src, a.chunks, a.mask, a.out, device=a.device, tokens=a.tokens,
         kept_cand=a.kept_candidates, steps=a.steps, lr=a.lr, batch=a.batch,
         chunk_index=a.chunk_index, max_layers=a.max_layers, max_batches=a.max_batches,
-        max_seq=a.max_seq)
+        max_seq=a.max_seq, skip_preflight=a.skip_preflight)
     return 0
 
 

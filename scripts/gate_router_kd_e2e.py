@@ -119,6 +119,29 @@ def main():
           f"w{tuple(r['w'].shape)} b{tuple(r['b'].shape)}")
     check("nothing became NaN or Inf", bool(torch.isfinite(r["w"]).all()), "")
 
+    # ---- the stage-6 pre-flight: it must pass on a good model AND fail on a broken one ----
+    from transformers import AutoConfig as _AC
+    reader2 = ShardReader(SRC)
+    keep_by = {1: torch.arange(E)[::2].clone()}
+    pf = D.preflight(cfg, reader2, keep_by, "cpu", torch.bfloat16, ids[:96], 32, K)
+    check("pre-flight passes on the real model", pf["rel"] < 2e-2,
+          f"layer {pf['layer']}, teacher mixture matches to {pf['rel']:.2e} in {pf['secs']:.0f}s")
+    check("pre-flight measures the candidate tensor rather than guessing",
+          pf["mb_per_token"] > 0, f"{pf['mb_per_token']*2048:.0f}MB projected at 2048 tokens")
+
+    # break the mixture and confirm the pre-flight refuses -- a check that cannot fail is not one
+    orig = RK._mix
+    RK._mix = lambda w, slot, out: orig(w, slot, out) * 0.5
+    try:
+        reader3 = ShardReader(SRC)
+        D.preflight(cfg, reader3, keep_by, "cpu", torch.bfloat16, ids[:96], 32, K)
+        check("pre-flight refuses a wrong teacher mixture", False, "it passed")
+    except SystemExit as e:
+        check("pre-flight refuses a wrong teacher mixture", "PREFLIGHT FAILED" in str(e),
+              str(e)[:72])
+    finally:
+        RK._mix = orig
+
     del layer, cand_out
     print(("GATE FAIL: " + ", ".join(FAIL)) if FAIL else "GATE PASS")
     return 1 if FAIL else 0
