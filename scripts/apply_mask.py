@@ -88,6 +88,22 @@ def run(src: Path, dst: Path, mask_path: Path, allow_ragged: bool = False,
                 f"{len(missing)} would keep the UNTRAINED sliced router while the rest are "
                 f"repaired, which is a checkpoint nobody measured: layers {missing[:8]}. "
                 f"Finish stage 6 (it is resumable per layer) or drop --router-kd.")
+        # VALIDATE THE KEEP ORDER BEFORE ANY SHARD IS WRITTEN. This check used to live inside the
+        # shard loop, so a mismatch surfaced partway through -- after tens of GB had already been
+        # written -- leaving a half-materialised checkpoint that looks like a real one. It costs
+        # nothing here and it is also the only place a --dry-run can catch it.
+        for li, km in sorted(kmap.items()):
+            order = [old for old, _ in sorted(km.items(), key=lambda kv: kv[1])]
+            trained = [int(x) for x in KD[li][2]]
+            if trained != order:
+                bad = next(i for i, (a, b) in enumerate(zip(trained, order)) if a != b)
+                raise SystemExit(
+                    f"router KD for layer {li} was trained against a different kept set than "
+                    f"this mask selects (first mismatch at position {bad}: trained kept expert "
+                    f"{trained[bad]}, mask keeps {order[bad]}). The router would point at the "
+                    f"wrong experts -- the checkpoint would load, run at full speed and emit "
+                    f"confident nonsense. Re-run stage 6 against this mask, or drop --router-kd. "
+                    f"Nothing has been written.")
 
     counts = {li: n_exp - len(p) for li, p in pruned.items()}
     uniform = len(set(counts.values())) == 1
@@ -153,12 +169,6 @@ def run(src: Path, dst: Path, mask_path: Path, allow_ragged: bool = False,
                         # not the order the experts are being renumbered in, the router points at
                         # the wrong experts -- a checkpoint that loads, runs at full speed and
                         # emits confident nonsense. Refuse rather than reconcile.
-                        if [int(x) for x in keep] != order:
-                            raise SystemExit(
-                                f"router KD for layer {li} was trained against a different kept "
-                                f"set than this mask selects (first mismatch at position "
-                                f"{next(i for i, (a, bb) in enumerate(zip([int(x) for x in keep], order)) if a != bb)}). "
-                                f"Re-run stage 6 against this mask, or drop --router-kd.")
                         rep = w if g.group(2) == "weight" else b
                         if tuple(rep.shape) != tuple(t[order].shape):
                             raise SystemExit(
