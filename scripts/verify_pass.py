@@ -55,30 +55,44 @@ def verify(acc: dict, f_sum: torch.Tensor, f_cnt: torch.Tensor, buckets: list,
         if rel > 1e-6:
             problems.append(f"{name}: F diagonal disagrees with sq/cnt by {rel:.2e} relative "
                             f"-- the F outer-product slot bookkeeping is wrong")
-        # Cauchy-Schwarz on the conditional means, applied ONLY where the means mean anything.
+        # THE OFF-DIAGONAL MAGNITUDE BOUND WAS REMOVED. It is ill-posed, and two successive
+        # attempts to keep it both rejected correct data and cost the run a restart each.
         #
-        # F_ii averages over the tokens where i fires; F_ij averages over the rarer set where i
-        # AND j fire. Cauchy-Schwarz holds WITHIN the co-activation set, not across two
-        # differently-normalised sets, so if i happens to fire hard on the few tokens where j
-        # also fires, |F_ij| > sqrt(F_ii*F_jj) with nothing wrong at all.
+        # Cauchy-Schwarz bounds F_ij by sqrt(E_Xij[a_i^2] * E_Xij[a_j^2]) -- expectations over
+        # the CO-ACTIVATION set. The diagonal we have is F_ii = E_Xi[a_i^2], an expectation over
+        # a DIFFERENT, larger set. If an expert fires harder than its own average precisely when
+        # its partner fires, |F_ij| exceeds sqrt(F_ii*F_jj) by an arbitrary margin with nothing
+        # wrong. Gating on co-activation count did not help, because the effect is conditional
+        # structure and not sampling noise: real chunk 1 still violated it on pairs with >= 64
+        # co-activations. Making it sound would need per-pair second moments, which the pass
+        # does not accumulate.
         #
-        # This is not theory: the check failed the real chunk 1 and aborted the pass, and the
-        # violations were measured to sit entirely on rare pairs --
-        #     violating pairs   median co-activation count 6   (max 42, mean 14.5)
-        #     passing pairs     median 51                      (mean 1046)
-        # -- i.e. conditional means over a handful of samples. Gating on the co-activation count
-        # keeps the check's real job (gross index corruption shows up on WELL-SAMPLED pairs,
-        # where a wrong index pairs unrelated magnitudes across thousands of tokens) while not
-        # firing on the statistics of a small sample.
-        MIN_PAIR_COUNT = 64
-        off = F - torch.diag(torch.diagonal(F))
-        bound = torch.sqrt(torch.outer(torch.diagonal(F).clamp(min=0),
-                                       torch.diagonal(F).clamp(min=0)))
-        well_sampled = f_cnt[li].cpu() >= MIN_PAIR_COUNT
-        viol = ((off.abs() > 10 * bound + 1e-9) & well_sampled).sum().item()
-        if viol:
-            problems.append(f"{name}: {viol} off-diagonal entries with >= {MIN_PAIR_COUNT} "
-                            f"co-activations exceed 10x sqrt(Fii*Fjj)")
+        # Replaced by two statements about the SLOT BOOKKEEPING that are exactly true, which is
+        # what the magnitude bound was a proxy for in the first place:
+        #
+        #   f_cnt[i,i] == cnt_i     an expert co-activates with itself on exactly its own tokens
+        #   f_cnt[i,j] <= min(cnt_i, cnt_j)   a pair cannot co-fire more often than either fires
+        #
+        # A wrong index in the outer-product scatter breaks both immediately, and neither can
+        # be tripped by legitimate statistics.
+        fc = f_cnt[li].cpu()
+        dc = torch.diagonal(fc)
+        bad = (dc[live] - cnt[live]).abs().max().item() if bool(live.any()) else 0.0
+        if bad > 0.5:
+            problems.append(f"{name}: f_cnt diagonal disagrees with the routed-token count by "
+                            f"{bad:.0f} -- the F slot bookkeeping is wrong")
+        # The SOUND cap is 2*min, not min: FAccumulator adds both orders (i,j) and (j,i), so
+        # f_cnt[i,j] = 2 * (tokens where both fire) and that is bounded by 2*min(cnt_i, cnt_j).
+        # Measured values sit far below even 1*min on real data -- co-activation is rare at
+        # top-8 of 256 -- but "observed on one sample" is exactly the reasoning that produced
+        # two false failures already, so the bound used here is the one that is guaranteed.
+        pair_cap = 2.0 * torch.minimum(cnt[:, None], cnt[None, :])
+        over = int((fc > pair_cap + 0.5).sum().item())
+        if over:
+            worst = float((fc - pair_cap).max().item())
+            problems.append(f"{name}: {over} expert pairs co-activate more often than one of "
+                            f"them activates at all (worst excess {worst:.0f}) -- impossible, "
+                            f"the F slot bookkeeping is wrong")
 
         if prev and name in prev:
             for k in ("sum", "sq", "cnt"):
