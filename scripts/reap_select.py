@@ -196,7 +196,9 @@ if __name__ == "__main__":
     ap.add_argument("--mode", choices=["reap", "hope"], default="hope")
     ap.add_argument("--criterion", choices=list(CRITERIA), default="reap_1_1_1")
     ap.add_argument("--protect-frac", type=float, default=0.0)
+    ap.add_argument("--allow-dead-domains", action="store_true",
+                    help="score only the domains that have routed mass")
     a = ap.parse_args()
     r = run(Path(a.acc), Path(a.out), a.ratio, a.mode, a.criterion,
-            protect_frac=a.protect_frac)
+            protect_frac=a.protect_frac, allow_dead=a.allow_dead_domains)
     print(json.dumps(r, indent=1))
