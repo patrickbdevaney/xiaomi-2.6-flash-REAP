@@ -149,7 +149,8 @@ if [ ! -f "$DST/config.json" ]; then
     say "ABORT: not enough free space for the pruned checkpoint. Nothing was deleted."
     exit 1
   fi
-  "$PY" scripts/apply_mask.py --dst "$DST" --mask "$MASKS/mask.json" >> "$LOG" 2>&1 \
+  "$PY" scripts/apply_mask.py --dst "$DST" --mask "$MASKS/mask.json" \
+        --router-kd "$MASKS/router_kd.pt" >> "$LOG" 2>&1 \
     || { say "STAGE 7 FAILED"; exit 1; }
 else
   say "STAGE 7 SKIPPED -- $DST/config.json exists"

@@ -140,6 +140,11 @@ def fit_layer(cand_out, t_slot, t_w, hidden, router_w, router_b, keep, kept_slot
     sw = router_w[keep].clone().detach().float().requires_grad_(True)
     sb = router_b[keep].clone().detach().float()          # NOT trained; see the module docstring
     opt = torch.optim.Adam([sw], lr=lr)
+    # Belt and braces: the only tensor that may carry a graph into a step is the student router.
+    # A caller that hands us attached expert outputs or hidden states would otherwise backward
+    # through the frozen model and fail on the second step.
+    cand_out, hidden = cand_out.detach(), hidden.detach()
+    t_w = t_w.detach()
     N = hidden.shape[0]
     g = torch.Generator(device="cpu").manual_seed(seed)
 

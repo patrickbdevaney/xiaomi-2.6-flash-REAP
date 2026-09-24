@@ -51,8 +51,26 @@ def keep_maps(pruned: dict[int, list[int]], n_exp: int) -> dict[int, dict[int, i
     return out
 
 
+def load_router_kd(path: Path | None):
+    """{layer_index: (weight, bias, keep)} from stage 6, or None.
+
+    WITHOUT THIS THE WHOLE OF STAGE 6 IS A NO-OP. apply_mask originally sliced the teacher's
+    router and never looked at router_kd.pt, so the pipeline would train routers for hours, save
+    them, and then write a checkpoint that did not contain them -- succeeding end to end with
+    the repair silently absent.
+    """
+    if path is None:
+        return None
+    import torch
+    d = torch.load(Path(path), map_location="cpu")
+    out = {}
+    for name, v in d.items():
+        out[int(name.split(".")[2])] = (v["weight"], v["bias"], v["keep"])
+    return out
+
+
 def run(src: Path, dst: Path, mask_path: Path, allow_ragged: bool = False,
-        dry_run: bool = False) -> dict:
+        dry_run: bool = False, router_kd: Path | None = None) -> dict:
     import torch
     from safetensors import safe_open
     from safetensors.torch import save_file
@@ -61,6 +79,15 @@ def run(src: Path, dst: Path, mask_path: Path, allow_ragged: bool = False,
     n_exp = int(cfg["n_routed_experts"])
     pruned = load_mask(mask_path)
     kmap = keep_maps(pruned, n_exp)
+    KD = load_router_kd(router_kd)
+    if KD is not None:
+        missing = sorted(set(kmap) - set(KD))
+        if missing:
+            raise SystemExit(
+                f"router KD covers {len(KD)} layers but the mask prunes {len(kmap)}; "
+                f"{len(missing)} would keep the UNTRAINED sliced router while the rest are "
+                f"repaired, which is a checkpoint nobody measured: layers {missing[:8]}. "
+                f"Finish stage 6 (it is resumable per layer) or drop --router-kd.")
 
     counts = {li: n_exp - len(p) for li, p in pruned.items()}
     uniform = len(set(counts.values())) == 1
@@ -120,7 +147,27 @@ def run(src: Path, dst: Path, mask_path: Path, allow_ragged: bool = False,
                     li = int(g.group(1))
                     order = [old for old, _ in sorted(kmap[li].items(), key=lambda kv: kv[1])]
                     t = f.get_tensor(name)
-                    out_tensors[name] = t[order].contiguous()
+                    if KD is not None and li in KD:
+                        w, b, keep = KD[li]
+                        # The trained router is indexed in the STUDENT's order. If that order is
+                        # not the order the experts are being renumbered in, the router points at
+                        # the wrong experts -- a checkpoint that loads, runs at full speed and
+                        # emits confident nonsense. Refuse rather than reconcile.
+                        if [int(x) for x in keep] != order:
+                            raise SystemExit(
+                                f"router KD for layer {li} was trained against a different kept "
+                                f"set than this mask selects (first mismatch at position "
+                                f"{next(i for i, (a, bb) in enumerate(zip([int(x) for x in keep], order)) if a != bb)}). "
+                                f"Re-run stage 6 against this mask, or drop --router-kd.")
+                        rep = w if g.group(2) == "weight" else b
+                        if tuple(rep.shape) != tuple(t[order].shape):
+                            raise SystemExit(
+                                f"router KD tensor for layer {li}.{g.group(2)} is "
+                                f"{tuple(rep.shape)}, expected {tuple(t[order].shape)}")
+                        out_tensors[name] = rep.to(t.dtype).contiguous()
+                        stats["kd_applied"] = stats.get("kd_applied", 0) + 1
+                    else:
+                        out_tensors[name] = t[order].contiguous()
                     stats["sliced"] += 1
                     continue
                 out_tensors[name] = f.get_tensor(name)
@@ -155,7 +202,11 @@ if __name__ == "__main__":
     ap.add_argument("--dst", default=str(Path.home() / "models" / "MiMo-V2.6-Flash-REAP50"))
     ap.add_argument("--mask", default="artifacts/masks/mask.json")
     ap.add_argument("--allow-ragged", action="store_true")
+    ap.add_argument("--router-kd", default=None,
+                    help="artifacts/masks/router_kd.pt from stage 6; without it "
+                         "the checkpoint keeps the untrained sliced router")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
-    s = run(Path(a.src), Path(a.dst), Path(a.mask), a.allow_ragged, a.dry_run)
+    s = run(Path(a.src), Path(a.dst), Path(a.mask), a.allow_ragged, a.dry_run,
+            router_kd=Path(a.router_kd) if a.router_kd else None)
     print(json.dumps(s, indent=1))

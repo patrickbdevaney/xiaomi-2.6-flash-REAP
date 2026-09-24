@@ -127,6 +127,48 @@ with tempfile.TemporaryDirectory() as td:
     check("--allow-ragged marks the checkpoint non-portable",
           c2.get("_ragged_experts") is True and "n_routed_experts_per_layer" in c2)
 
+    print("\n[8] router KD reaches the checkpoint, and a mismatch is refused")
+    # apply_mask originally never referenced router_kd.pt at all: stage 6 would train for hours
+    # and stage 7 would write the teacher's sliced router, succeeding with the repair absent.
+    kept1 = sorted(set(range(N_EXP)) - set(pruned["model.layers.1.mlp"]))
+    kept2 = sorted(set(range(N_EXP)) - set(pruned["model.layers.2.mlp"]))
+    K = len(kept1)
+    kd = {"model.layers.1.mlp": {"weight": torch.full((K, HID), 7.0),
+                                 "bias": torch.full((K,), 7.0),
+                                 "keep": torch.tensor(kept1)},
+          "model.layers.2.mlp": {"weight": torch.full((K, HID), 9.0),
+                                 "bias": torch.full((K,), 9.0),
+                                 "keep": torch.tensor(kept2)}}
+    kdp = td / "router_kd.pt"; torch.save(kd, kdp)
+    d4 = td / "d4"
+    s4 = AM.run(src, d4, mask, router_kd=kdp)
+    o4 = load_file(str(sorted(d4.glob("*.safetensors"))[0]))
+    check("trained router reaches the checkpoint",
+          float(o4["model.layers.1.mlp.gate.weight"][0, 0]) == 7.0,
+          f"gate.weight[0,0]={float(o4['model.layers.1.mlp.gate.weight'][0,0])} "
+          f"(7.0 trained, else the teacher slice)")
+    check("each layer gets its OWN trained router",
+          float(o4["model.layers.2.mlp.gate.weight"][0, 0]) == 9.0, "layer 2 is not layer 1's")
+    check("the KD application is counted", s4.get("kd_applied") == 4, str(s4.get("kd_applied")))
+
+    kd_bad = {k: dict(v) for k, v in kd.items()}
+    kd_bad["model.layers.1.mlp"]["keep"] = torch.tensor(kept1[::-1])
+    badp = td / "kd_bad.pt"; torch.save(kd_bad, badp)
+    try:
+        AM.run(src, td / "d5", mask, router_kd=badp)
+        check("a router trained against a different kept set is refused", False, "accepted")
+    except SystemExit as e:
+        check("a router trained against a different kept set is refused",
+              "different kept set" in str(e), str(e)[:60])
+
+    partp = td / "kd_part.pt"
+    torch.save({"model.layers.1.mlp": kd["model.layers.1.mlp"]}, partp)
+    try:
+        AM.run(src, td / "d6", mask, router_kd=partp)
+        check("a partial stage 6 is refused", False, "accepted")
+    except SystemExit as e:
+        check("a partial stage 6 is refused", "would keep the UNTRAINED" in str(e), str(e)[:60])
+
 print("\n" + ("GATE FAIL: " + ", ".join(FAIL) if FAIL else
               "GATE PASS: mask application preserves router-to-expert correspondence"))
 sys.exit(1 if FAIL else 0)

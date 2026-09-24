@@ -101,18 +101,27 @@ def expert_outputs(experts, hid, cand, dtype):
     An expert that appears at two candidate slots for the same token must produce the same value
     at both, or the teacher's lookup and the student's lookup disagree about the same expert --
     the failure the gate caught when its fixture drew fresh noise per slot.
+
+    RUNS UNDER no_grad AND RETURNS A DETACHED TENSOR. The experts are frozen -- only the router
+    trains -- but they are real nn.Modules whose weights carry requires_grad, so without this the
+    returned tensor is attached to an autograd graph through all 256 of them. The first
+    optimiser step then frees that graph and the second dies with "Trying to backward through
+    the graph a second time". Measured on real layer-1 weights; the synthetic gate never saw it
+    because its fixture was a plain tensor. It is also a memory bug: every step would otherwise
+    retain a graph back through every expert it touched.
     """
     N, C = cand.shape
     out = torch.zeros(N, C, hid.shape[-1], dtype=dtype, device=hid.device)
-    for e in torch.unique(cand).tolist():
-        m = cand == e
-        toks = m.any(1).nonzero(as_tuple=True)[0]
-        y = experts[e](hid[toks].to(dtype))
-        pos = torch.full((N,), -1, dtype=torch.long, device=hid.device)
-        pos[toks] = torch.arange(len(toks), device=hid.device)
-        ns, cs = m.nonzero(as_tuple=True)
-        out[ns, cs] = y[pos[ns]]
-    return out
+    with torch.no_grad():
+        for e in torch.unique(cand).tolist():
+            m = cand == e
+            toks = m.any(1).nonzero(as_tuple=True)[0]
+            y = experts[e](hid[toks].to(dtype))
+            pos = torch.full((N,), -1, dtype=torch.long, device=hid.device)
+            pos[toks] = torch.arange(len(toks), device=hid.device)
+            ns, cs = m.nonzero(as_tuple=True)
+            out[ns, cs] = y[pos[ns]]
+    return out.detach()
 
 
 def load_keep(mask_path: Path, n_exp: int) -> dict[int, torch.Tensor]:
@@ -136,7 +145,8 @@ def _busy() -> str | None:
 
 
 def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16,
-        tokens=2048, kept_cand=32, steps=300, lr=1e-3, batch=512, chunk_index=0, seed=0):
+        tokens=2048, kept_cand=32, steps=300, lr=1e-3, batch=512, chunk_index=0, seed=0,
+        max_layers=None, max_batches=None):
     from transformers import AutoConfig
     src, out_dir = Path(src), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -151,6 +161,12 @@ def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16
     chunk_files = sorted(Path(chunks_dir).glob("chunk_*.pt"))
     cf = chunk_files[chunk_index]
     states = torch.load(cf, map_location="cpu")
+    # REHEARSAL LIMITS. Both default to None. They exist so the full driver -- hook, reservoir,
+    # candidate build, expert evaluation, fit, checkpoint, resume -- can be executed end to end
+    # on CPU against real weights before it runs for real at hour 31. A stage that has never
+    # been executed is not a stage that works.
+    if max_batches:
+        states = states[:max_batches]
     S = states[0]["ids"].shape[1]
     masks = masks_for(S, cfg.sliding_window, device, dtype)
     pos = torch.arange(S, device=device)[None]
@@ -166,7 +182,7 @@ def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16
           f"budget {tokens} rows, {kept_cand} kept candidates, {steps} steps", flush=True)
 
     t0 = time.time()
-    for li in range(n_layers):
+    for li in range(min(n_layers, max_layers or n_layers)):
         layer = build_layer(cfg, li, reader, dtype).to(device)
         is_moe = hasattr(layer.mlp, "experts")
         name = f"model.layers.{li}.mlp"
@@ -253,6 +269,10 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--chunk-index", type=int, default=0)
+    ap.add_argument("--max-layers", type=int, default=None,
+                    help="rehearsal only: stop after this many layers")
+    ap.add_argument("--max-batches", type=int, default=None,
+                    help="rehearsal only: stream only this many batches of the chunk")
     ap.add_argument("--force", action="store_true",
                     help="run even while the calibration pass holds the GPU")
     a = ap.parse_args()
@@ -263,7 +283,7 @@ def main():
         return 2
     run(a.src, a.chunks, a.mask, a.out, device=a.device, tokens=a.tokens,
         kept_cand=a.kept_candidates, steps=a.steps, lr=a.lr, batch=a.batch,
-        chunk_index=a.chunk_index)
+        chunk_index=a.chunk_index, max_layers=a.max_layers, max_batches=a.max_batches)
     return 0
 
 
