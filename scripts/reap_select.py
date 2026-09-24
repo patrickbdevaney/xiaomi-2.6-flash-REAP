@@ -146,7 +146,7 @@ def run(acc_path: Path, out_path: Path, ratio: float, mode: str, crit: str,
         bucket_weights=None, protect_frac: float = 0.0, allow_dead: bool = False) -> dict:
     acc, f_sum, f_cnt, buckets = load_acc(acc_path)
     live = assert_domains_live(acc, buckets, "selection", allow_dead)["live_mask"]
-    per_layer, ret_by_layer = {}, []
+    per_layer, ret_by_layer, icost = {}, [], []
     for name in sorted(acc, key=layer_index):
         li = layer_index(name)
         a = acc[name]
@@ -165,6 +165,15 @@ def run(acc_path: Path, out_path: Path, ratio: float, mode: str, crit: str,
         pruned = select_layer(F, s, n_prune, mode, protect=protect)
         per_layer[name] = sorted(int(i) for i in pruned)
         ret_by_layer.append(retention(domain_mass(a), pruned))
+        # HOPE'S OWN OBJECTIVE, alongside REAP's. `worst_retention` measures retained gated
+        # output mass, which REAP's greedy ranking maximises BY CONSTRUCTION and HOPE does not --
+        # so ranking selections by it guarantees REAP wins and silently discards the interaction
+        # terms the whole F accumulation exists to provide. p^T F p is the quantity HOPE
+        # minimises: the output error a prune set actually causes, interactions included.
+        # Normalised by the same quantity for the all-experts vector so layers are comparable.
+        pv = np.zeros(n_exp); pv[pruned] = 1.0
+        denom = float(np.ones(n_exp) @ F @ np.ones(n_exp))
+        icost.append(float(pv @ F @ pv) / denom if denom > 0 else 0.0)
     R = np.stack(ret_by_layer)                      # [n_layer, n_bucket]
     per_domain = R.mean(0)
     # The WORST is taken over live domains only. A dead domain retains zero under every
@@ -178,6 +187,8 @@ def run(acc_path: Path, out_path: Path, ratio: float, mode: str, crit: str,
         "worst_domain": buckets[int(np.argmin(scored))],
         "worst_retention": float(scored.min()),
         "mean_retention": float(per_domain[live].mean()),
+        "interaction_cost": float(np.mean(icost)),
+        "interaction_cost_max": float(np.max(icost)),
         "scored_domains": [b for b, m in zip(buckets, live) if m],
         "layers": len(per_layer),
         "pruned_per_layer": {k: len(v) for k, v in per_layer.items()},

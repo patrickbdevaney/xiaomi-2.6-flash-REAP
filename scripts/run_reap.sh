@@ -138,7 +138,8 @@ echo stage3-criterion > logs/.stage
 if [ "$START_STAGE" -le 3 ] && [ ! -f "$MASKS/comparison.json" ]; then
   say "STAGE 3 criterion comparison at ratio $RATIO"
   "$PY" scripts/criterion_compare.py --acc "$ACC" \
-        --out-dir "$MASKS" --ratio "$RATIO" $DEAD_FLAG >> "$LOG" 2>&1 \
+        --out-dir "$MASKS" --ratio "$RATIO" --select-by "${SELECT_BY:-hope}" $DEAD_FLAG \
+        >> "$LOG" 2>&1 \
     || { say "STAGE 3 FAILED"; exit 1; }
 else
   say "STAGE 3 SKIPPED -- $MASKS/comparison.json exists"
