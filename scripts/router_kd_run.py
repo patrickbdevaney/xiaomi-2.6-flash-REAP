@@ -138,6 +138,50 @@ def _rss_mb() -> int:
     return 0
 
 
+
+def _sample_states(chunks_dir: Path, per_domain: int, batches: int):
+    """Batches drawn from chunks spanning EVERY domain, not one chunk.
+
+    TWO THINGS WERE WRONG WITH TAKING A SINGLE CHUNK.
+
+    First, the routers would be fitted on ONE DOMAIN. Chunks are bucket-homogeneous -- that is
+    what the corpus blocking means -- so chunk 0 is agentic and nothing else. The mask being
+    repaired is global across nine domains; fitting its routers on agentic alone repairs the
+    wrong thing, and video, the domain with the least evidence already, would contribute nothing.
+
+    Second, it was enormously wasteful. The driver streamed a whole 2 M-token chunk through 48
+    layers -- one to two hours of GPU -- to keep a reservoir of 2048 rows. Hidden states at layer
+    L require the full sequence through layers 0..L-1, so the forward cannot be subsampled by
+    TOKEN, but it can be subsampled by BATCH, and a few batches per domain is a far better sample
+    than hundreds from one.
+
+    The reservoir still runs: it is what makes the kept rows uniform over the batches supplied.
+    """
+    files = sorted(chunks_dir.glob("chunk_*.pt"))
+    if not files:
+        raise SystemExit(f"no chunks in {chunks_dir}")
+    cache = chunks_dir / "chunk_buckets.json"
+    known = json.loads(cache.read_text()) if cache.exists() else {}
+    by_bucket: dict[str, list[Path]] = {}
+    for f in files:
+        b = known.get(f.name)
+        if b is None:                      # no cache: fall back to reading the chunk's own label
+            st = torch.load(f, map_location="cpu", weights_only=False)
+            b = st[0]["bucket"]; del st
+        by_bucket.setdefault(b, []).append(f)
+    picked, out = [], []
+    for b in sorted(by_bucket):
+        for f in by_bucket[b][:max(1, per_domain)]:
+            st = torch.load(f, map_location="cpu", weights_only=False)
+            take = st[:batches] if batches else st
+            out.extend(take)
+            picked.append(f"{b}:{len(take)}")
+            del st
+    print(f"router KD sample: {len(out)} batches from {len(by_bucket)} domains "
+          f"({', '.join(picked)})", flush=True)
+    return out, files[0]
+
+
 def _avail_mb() -> int:
     with open("/proc/meminfo") as f:
         for ln in f:
@@ -234,7 +278,8 @@ def _busy() -> str | None:
 
 def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16,
         tokens=2048, kept_cand=32, steps=300, lr=1e-3, batch=512, chunk_index=0, seed=0,
-        max_layers=None, max_batches=None, max_seq=None, skip_preflight=False):
+        max_layers=None, max_batches=None, max_seq=None, skip_preflight=False,
+        chunks_per_domain=1, batches_per_chunk=8):
     from transformers import AutoConfig
     src, out_dir = Path(src), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -246,9 +291,7 @@ def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16
     keep_by_layer = load_keep(Path(mask_path), n_exp)
     reader = ShardReader(src)
 
-    chunk_files = sorted(Path(chunks_dir).glob("chunk_*.pt"))
-    cf = chunk_files[chunk_index]
-    states = torch.load(cf, map_location="cpu")
+    states, cf = _sample_states(Path(chunks_dir), chunks_per_domain, batches_per_chunk)
     # REHEARSAL LIMITS. Both default to None. They exist so the full driver -- hook, reservoir,
     # candidate build, expert evaluation, fit, checkpoint, resume -- can be executed end to end
     # on CPU against real weights before it runs for real at hour 31. A stage that has never
@@ -292,7 +335,7 @@ def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16
 
     mod = _modeling(cfg)
     emb = None
-    print(f"router KD over {cf.name}: {len(states)} batches x {S} tokens, "
+    print(f"router KD: {len(states)} batches x {S} tokens, "
           f"budget {tokens} rows, {kept_cand} kept candidates, {steps} steps", flush=True)
 
     t0 = time.time()
@@ -405,7 +448,10 @@ def main():
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch", type=int, default=512)
-    ap.add_argument("--chunk-index", type=int, default=0)
+    ap.add_argument("--chunk-index", type=int, default=0, help="(unused; kept for scripts)")
+    ap.add_argument("--chunks-per-domain", type=int, default=1)
+    ap.add_argument("--batches-per-chunk", type=int, default=8,
+                    help="batches taken from each sampled chunk; 0 takes the whole chunk")
     ap.add_argument("--max-layers", type=int, default=None,
                     help="rehearsal only: stop after this many layers")
     ap.add_argument("--max-batches", type=int, default=None,
@@ -425,6 +471,7 @@ def main():
     run(a.src, a.chunks, a.mask, a.out, device=a.device, tokens=a.tokens,
         kept_cand=a.kept_candidates, steps=a.steps, lr=a.lr, batch=a.batch,
         chunk_index=a.chunk_index, max_layers=a.max_layers, max_batches=a.max_batches,
+        chunks_per_domain=a.chunks_per_domain, batches_per_chunk=a.batches_per_chunk,
         max_seq=a.max_seq, skip_preflight=a.skip_preflight)
     return 0
 

@@ -61,6 +61,53 @@ def main():
     check("captions differ between clips", len(set(txts)) == len(txts),
           f"{len(set(txts))} distinct texts across {len(txts)} clips (the old path gave 1)")
 
+    # ---- the retry loop: a dropped stream must resume, not end the top-up ----
+    # Documented Hub behaviour for long reads is HTTP 429 and mid-stream disconnects, and
+    # streaming=True has no resume -- an exception ends the iterator. Drive that path directly.
+    import datasets as _ds
+    real_load = _ds.load_dataset
+    state = {"opens": 0, "skipped": None}
+
+    class Flaky:
+        """Yields 5 rows, then raises once; on reopen, honours .skip() and yields normally."""
+        def __init__(self, rows, start=0):
+            self.rows, self.start = rows, start
+        def skip(self, n):
+            state["skipped"] = n
+            return Flaky(self.rows, self.start + n)
+        def __iter__(self):
+            for i in range(self.start, len(self.rows)):
+                if state["opens"] == 1 and i == self.start + 5:
+                    raise ConnectionError("simulated mid-stream drop")
+                yield self.rows[i]
+
+    rows = [{"__key__": f"./scene{i//2:03d}/f{i%2}", "jpeg": None} for i in range(40)]
+
+    def fake_load(*a, **k):
+        state["opens"] += 1
+        return Flaky(rows)
+
+    class _Img:
+        def convert(self, _):
+            return "frame"
+    for r in rows:
+        r["jpeg"] = _Img()
+
+    _ds.load_dataset = fake_load
+    real_caps = BC.video_captions
+    BC.video_captions = lambda *a, **k: {}
+    try:
+        got = list(itertools.islice(BC.iter_video_clips(2), 12))
+    finally:
+        _ds.load_dataset = real_load
+        BC.video_captions = real_caps
+
+    check("a dropped stream is retried rather than ending the top-up", state["opens"] >= 2,
+          f"{state['opens']} stream opens")
+    check("the retry resumes instead of re-reading from row 0", state["skipped"] == 5,
+          f"skipped {state['skipped']} rows on reopen")
+    check("clips still come out after the drop", len(got) >= 10, f"{len(got)} clips yielded")
+
     print(("GATE FAIL: " + ", ".join(FAIL)) if FAIL else "GATE PASS")
     return 1 if FAIL else 0
 

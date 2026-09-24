@@ -98,6 +98,8 @@ def _row_text(row):
     return ""
 
 
+VIDEO_STREAM_RETRIES = 6
+
 VIDEO_TEXT_FILES = (
     "video_instruction/train/sft/video_caption_300k.jsonl",   # matches the train_300k frames
     "video_instruction/train/qa/chatgpt_qa_240k.jsonl",       # QA, for prompt diversity
@@ -157,24 +159,52 @@ def iter_video_clips(frames_per_clip: int):
     the directory part of the key. A scene shorter than `frames_per_clip` is skipped rather than
     padded -- a clip of repeated frames would teach the temporal path nothing.
     """
+    import time
     from datasets import load_dataset
     hid, cfgn, split, _ = SPEC.VIDEO_SOURCES[0]
     caps = video_captions()
     print(f"    video captions loaded: {len(caps):,} scenes", flush=True)
-    ds = load_dataset(hid, cfgn, split=split, streaming=True)
-    cur_key, buf, hit, miss = None, [], 0, 0
-    for row in ds:
-        key = row["__key__"].rsplit("/", 1)[0]
-        if key != cur_key:
-            cur_key, buf = key, []
-        buf.append(row["jpeg"].convert("RGB"))
-        if len(buf) == frames_per_clip:
-            txt = caps.get(key.lstrip("./"), "")
-            hit, miss = hit + bool(txt), miss + (not txt)
-            if (hit + miss) % 200 == 0:
-                print(f"    video text: {hit}/{hit+miss} clips captioned", flush=True)
-            yield buf, txt
-            buf = []
+
+    # A STREAMED WEBDATASET DROPS. HTTP 429 and mid-stream disconnects are both documented
+    # behaviour for long Hub reads, and `streaming=True` has no resume: an exception ends the
+    # iterator and everything consumed so far is lost. This loop reopens the stream and skips
+    # what it already yielded, so a drop costs a re-read rather than the whole top-up. Without
+    # it, one 429 turns stage 2B into a no-op after an hour of tower work.
+    rows_seen, attempt, cur_key, buf, hit, miss = 0, 0, None, [], 0, 0
+    while True:
+        try:
+            ds = load_dataset(hid, cfgn, split=split, streaming=True)
+            if rows_seen:
+                ds = ds.skip(rows_seen)
+                print(f"    video stream resumed, skipping {rows_seen:,} rows", flush=True)
+            for row in ds:
+                rows_seen += 1
+                key = row["__key__"].rsplit("/", 1)[0]
+                if key != cur_key:
+                    cur_key, buf = key, []
+                buf.append(row["jpeg"].convert("RGB"))
+                if len(buf) == frames_per_clip:
+                    txt = caps.get(key.lstrip("./"), "")
+                    hit, miss = hit + bool(txt), miss + (not txt)
+                    if (hit + miss) % 200 == 0:
+                        print(f"    video text: {hit}/{hit+miss} clips captioned", flush=True)
+                    yield buf, txt
+                    buf = []
+            return                      # the stream ended normally
+        except GeneratorExit:
+            raise                       # the consumer stopped us; not a stream failure
+        except Exception as e:
+            attempt += 1
+            if attempt > VIDEO_STREAM_RETRIES:
+                print(f"    ! video stream failed {attempt} times, giving up "
+                      f"({str(e)[:110]})", flush=True)
+                return
+            back = min(60, 2 ** attempt)
+            print(f"    ! video stream dropped after {rows_seen:,} rows "
+                  f"({type(e).__name__}: {str(e)[:80]}); retry {attempt}/"
+                  f"{VIDEO_STREAM_RETRIES} in {back}s", flush=True)
+            time.sleep(back)
+            cur_key, buf = None, []      # a partial clip cannot be trusted across a reconnect
 
 
 MIN_BUCKET_FRAC = 0.50      # below this a bucket is a failed run, not a thin one
