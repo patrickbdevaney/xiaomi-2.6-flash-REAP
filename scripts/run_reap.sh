@@ -74,4 +74,86 @@ say "STAGE 2 rc=$RC"
 
 "$PY" scripts/verify_pass.py --out artifacts/saliency >> "$LOG" 2>&1 \
   && say "FINAL VERIFY PASS" || { say "FINAL VERIFY FAILED"; exit 1; }
-say "REAP calibration COMPLETE -- next: HOPE QP, per-layer budget search, Router KD"
+say "REAP calibration COMPLETE"
+
+# ---------------------------------------------------------------------------------------------
+# STAGES 3-7. Each one skips if its output already exists, so a restart anywhere past the pass
+# costs only the stage it died in. None of them touch the source checkpoint.
+# ---------------------------------------------------------------------------------------------
+RATIO=${PRUNE_RATIO:-0.50}
+MASKS=artifacts/masks
+mkdir -p "$MASKS"
+
+echo stage3-criterion > logs/.stage
+if [ ! -f "$MASKS/comparison.json" ]; then
+  say "STAGE 3 criterion comparison at ratio $RATIO"
+  "$PY" scripts/criterion_compare.py --acc artifacts/saliency/accumulators.pt \
+        --out-dir "$MASKS" --ratio "$RATIO" >> "$LOG" 2>&1 \
+    || { say "STAGE 3 FAILED"; exit 1; }
+else
+  say "STAGE 3 SKIPPED -- $MASKS/comparison.json exists"
+fi
+# The winner is chosen by WORST-DOMAIN retention, never by the mean: averaging is how a criterion
+# that destroys one capability outscores one that preserves all of them (arXiv 2606.03328 measured
+# 2.85 averaged points hiding 51.9 points of code retention).
+CRIT=$("$PY" -c "import json;r=json.load(open('$MASKS/comparison.json'));print(r[0]['criterion'])")
+MODE=$("$PY" -c "import json;r=json.load(open('$MASKS/comparison.json'));print(r[0]['mode'])")
+say "STAGE 3 winner: $CRIT / $MODE"
+
+echo stage4-budget > logs/.stage
+if [ ! -f "$MASKS/layer_budget.json" ]; then
+  say "STAGE 4 per-layer budget search (EvoESAP), criterion $CRIT"
+  "$PY" scripts/layer_budget.py --acc artifacts/saliency/accumulators.pt \
+        --out "$MASKS/layer_budget.json" --ratio "$RATIO" --criterion "$CRIT" \
+    >> "$LOG" 2>&1 || { say "STAGE 4 FAILED"; exit 1; }
+else
+  say "STAGE 4 SKIPPED -- $MASKS/layer_budget.json exists"
+fi
+# REPORTED, NOT APPLIED. `n_routed_experts` is a global scalar in the modelling code and llama.cpp
+# reads a single `n_expert`, so a ragged per-layer budget cannot be loaded by transformers, vLLM
+# or any GGUF without patched modelling. The search runs because its GAIN is the number that says
+# whether non-portability would be worth it; acting on it is a deliberate choice, not a default.
+say "STAGE 4 gain over uniform: $("$PY" -c "import json;d=json.load(open('$MASKS/layer_budget.json'));print(f\"{d['uniform_worst']:.4f} -> {d['searched_worst']:.4f} ({d['gain']:+.4f})\")")"
+say "STAGE 4 NOT APPLIED -- uniform budget keeps the checkpoint loadable; see layer_budget.py"
+
+echo stage5-select > logs/.stage
+if [ ! -f "$MASKS/mask.json" ]; then
+  say "STAGE 5 expert selection: $CRIT / $MODE at $RATIO (uniform per-layer)"
+  "$PY" scripts/reap_select.py --acc artifacts/saliency/accumulators.pt \
+        --out "$MASKS/mask.json" --ratio "$RATIO" --mode "$MODE" --criterion "$CRIT" \
+    >> "$LOG" 2>&1 || { say "STAGE 5 FAILED"; exit 1; }
+else
+  say "STAGE 5 SKIPPED -- $MASKS/mask.json exists"
+fi
+
+echo stage6-routerkd > logs/.stage
+if [ ! -f "$MASKS/router_kd.pt" ] || [ "${FORCE_KD:-0}" = "1" ]; then
+  # --force because this script IS reap_run.service: router_kd_run refuses to start
+  # while that unit is active, which would otherwise make it refuse itself.
+  say "STAGE 6 router KD (output matching, routers only)"
+  "$PY" scripts/router_kd_run.py --chunks artifacts/chunks --mask "$MASKS/mask.json" \
+        --out "$MASKS" --force >> "$LOG" 2>&1 || { say "STAGE 6 FAILED"; exit 1; }
+else
+  say "STAGE 6 SKIPPED -- $MASKS/router_kd.pt exists"
+fi
+
+echo stage7-apply > logs/.stage
+DST=${REAP_DST:-$HOME/models/MiMo-V2.6-Flash-REAP$(printf '%.0f' "$(echo "$RATIO*100" | bc)")}
+if [ ! -f "$DST/config.json" ]; then
+  # The pruned checkpoint is written, never edited in place, so the source survives a failure --
+  # and there must be room for it before a multi-hour copy discovers there is not.
+  NEED=$(du -sm "$HOME/models/MiMo-V2.6-Flash-RL" | cut -f1)
+  FREE=$(df -Pm "$(dirname "$DST")" | awk 'NR==2{print $4}')
+  say "STAGE 7 apply mask -> $DST (need <= ${NEED}MB, free ${FREE}MB)"
+  if [ "$FREE" -lt "$NEED" ]; then
+    say "ABORT: not enough free space for the pruned checkpoint. Nothing was deleted."
+    exit 1
+  fi
+  "$PY" scripts/apply_mask.py --dst "$DST" --mask "$MASKS/mask.json" >> "$LOG" 2>&1 \
+    || { say "STAGE 7 FAILED"; exit 1; }
+else
+  say "STAGE 7 SKIPPED -- $DST/config.json exists"
+fi
+
+echo done > logs/.stage
+say "REAP COMPLETE: $DST  (criterion $CRIT / $MODE at $RATIO)"
