@@ -134,7 +134,8 @@ def run(src, chunks_dir, out_dir, device="cuda", dtype=torch.bfloat16,
         return e
 
     buckets = json.loads((chunks_dir / "manifest.json").read_text())["buckets"]
-    chunk_files = sorted(chunks_dir.glob("chunk_*.pt"))[: smoke_chunks or None]
+    chunk_files = sorted(chunks_dir.glob("chunk_*.pt"))
+    chunk_files = chunk_order(chunks_dir, chunk_files)[: smoke_chunks or None]
     assert chunk_files, f"no chunks in {chunks_dir}"
     # ORPHAN GUARD. A corpus build that dies before its first checkpoint leaves chunk files on
     # disk that no manifest accounts for, and the next build -- starting again at index 0 --
@@ -257,6 +258,44 @@ def _rope(cfg, atype, hs, pos, device, dtype):
                                         is_swa=(atype == "sliding_window_attention")).to(device)
         _ROPE_CACHE[key] = tuple(t.to(dtype) for t in emb(hs, pos))
     return _ROPE_CACHE[key]
+
+
+def chunk_order(chunks_dir: Path, files: list[Path]) -> list[Path]:
+    """Interleave the chunks across BUCKETS instead of taking them in name order.
+
+    The corpus builder emits chunks grouped by bucket -- all six agentic chunks, then all five
+    code, and so on -- so name order walks the domains in BLOCKS. That put image at chunks 20-21,
+    audio at 22 and video at 23: roughly hours 27 to 30 of a 33-hour pass. Any failure before
+    that point leaves those domains with literally zero routed tokens, and an expert with no
+    evidence is pruned arbitrarily rather than on measurement. Blocked visiting is the same
+    mistake CLAUDE.md warns about for benchmarks, one level up.
+
+    Order changes NOTHING about the finished result: every accumulator is a sum, and the resume
+    state is a set of chunk names, not a position. What it changes is what a PARTIAL result
+    contains. The key sorts each chunk by its fractional position within its own bucket, with
+    ties broken toward the rarer bucket, so every bucket's first chunk comes before any bucket's
+    second -- all nine domains are represented within the first nine chunks.
+    """
+    cache = chunks_dir / "chunk_buckets.json"
+    known = json.loads(cache.read_text()) if cache.exists() else {}
+    dirty = False
+    for f in files:
+        if f.name not in known:
+            st = torch.load(f, map_location="cpu", weights_only=False)
+            known[f.name] = st[0]["bucket"]
+            del st
+            dirty = True
+    if dirty:
+        _atomic_write(cache, json.dumps(known, indent=1))
+    from collections import Counter
+    n = Counter(known[f.name] for f in files)
+    seen = Counter()
+    keyed = []
+    for f in sorted(files):
+        b = known[f.name]
+        keyed.append(((seen[b] / n[b], n[b], f.name), f))
+        seen[b] += 1
+    return [f for _, f in sorted(keyed, key=lambda kv: kv[0])]
 
 
 def _atomic_write(path: Path, text: str) -> None:
