@@ -137,8 +137,15 @@ say "STAGE 4 NOT APPLIED -- uniform budget keeps the checkpoint loadable; see la
 echo stage5-select > logs/.stage
 if [ "$START_STAGE" -le 5 ] && [ ! -f "$MASKS/mask.json" ]; then
   say "STAGE 5 expert selection: $CRIT / $MODE at $RATIO (uniform per-layer)"
+  # PROTECT_FRAC protects the top slice of EVERY DOMAIN separately. It is the only guard against
+  # a global ranking dropping an expert that only one thin domain uses. Measured at 5 chunks:
+  # video reached 35.4% expert coverage (6.2% in its worst layer, 16 of 256) against agentic's
+  # 73.6%, on the same token count as audio, because its clips carry no text diversity -- and
+  # video has exactly ONE chunk in the corpus, so that number is final. Default 0 until the full
+  # accumulators exist, because the right value depends on how much the domains overlap.
   "$PY" scripts/reap_select.py --acc "$ACC" \
         --out "$MASKS/mask.json" --ratio "$RATIO" --mode "$MODE" --criterion "$CRIT" $DEAD_FLAG \
+        --protect-frac "${PROTECT_FRAC:-0}" \
     >> "$LOG" 2>&1 || { say "STAGE 5 FAILED"; exit 1; }
 else
   say "STAGE 5 SKIPPED -- $MASKS/mask.json exists"
