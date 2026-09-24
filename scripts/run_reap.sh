@@ -11,6 +11,10 @@ PY="${PY_BIN:-$HOME/glm-5.3-reap/.venv/bin/python}"
 LOG=logs/reap_run.log
 TOTAL=${TOTAL_TOKENS:-50000000}
 SEQ=${SEQ_LEN:-4096}
+START_STAGE=${START_STAGE:-1}
+DEAD_FLAG=""; [ "${ALLOW_DEAD:-0}" = "1" ] && DEAD_FLAG="--allow-dead-domains"
+DRY_FLAG="";  [ "${DRY_RUN:-0}" = "1" ]    && DRY_FLAG="--dry-run"
+ACC=${ACC_PATH:-artifacts/saliency/accumulators.pt}
 mkdir -p logs artifacts
 say() { echo "[$(date -Is)] $*" | tee -a "$LOG"; }
 
@@ -31,7 +35,11 @@ say "REAP run start: $TOTAL tokens, seq_len $SEQ, free $(df -h / | awk 'NR==2{pr
 # resumes exactly, per bucket in stage 1 and per chunk in stage 2, and is restarted automatically)
 # instead of the session or the desktop. The media worker sets 1000 so it is taken before us.
 echo 500 > /proc/self/oom_score_adj 2>/dev/null || say "WARN: could not set oom_score_adj"
-MIN_AVAIL_MB=${MIN_AVAIL_MB:-90000}
+# The floor is what STAGE 2 needs: it streams 48 layers of a 173 GB model. Entering at a later
+# stage does not, and enforcing stage 2's floor there would refuse a legitimate re-selection --
+# stages 3-5 are numpy over a 56 MB accumulator file.
+if [ "$START_STAGE" -le 2 ]; then MIN_AVAIL_MB=${MIN_AVAIL_MB:-90000}
+else MIN_AVAIL_MB=${MIN_AVAIL_MB:-20000}; fi
 sync; sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || say "WARN: drop_caches unavailable"
 AVAIL=$(awk '/MemAvailable:/{print int($2/1024)}' /proc/meminfo)
 say "pre-flight MemAvailable ${AVAIL}MB (floor ${MIN_AVAIL_MB}MB)"
@@ -65,6 +73,7 @@ else
   say "STAGE 1 SKIPPED -- artifacts/chunks/manifest.json already exists"
 fi
 
+if [ "$START_STAGE" -le 2 ]; then
 echo stage2-pass > logs/.stage
 say "STAGE 2 calibration pass (48 layers)"
 "$PY" scripts/calib_pass.py --chunks artifacts/chunks --out artifacts/saliency >> "$LOG" 2>&1
@@ -75,20 +84,28 @@ say "STAGE 2 rc=$RC"
 "$PY" scripts/verify_pass.py --out artifacts/saliency >> "$LOG" 2>&1 \
   && say "FINAL VERIFY PASS" || { say "FINAL VERIFY FAILED"; exit 1; }
 say "REAP calibration COMPLETE"
+else
+  say "STAGES 1-2 SKIPPED -- START_STAGE=$START_STAGE"
+fi
 
 # ---------------------------------------------------------------------------------------------
 # STAGES 3-7. Each one skips if its output already exists, so a restart anywhere past the pass
 # costs only the stage it died in. None of them touch the source checkpoint.
 # ---------------------------------------------------------------------------------------------
 RATIO=${PRUNE_RATIO:-0.50}
-MASKS=artifacts/masks
+MASKS=${MASKS_DIR:-artifacts/masks}
 mkdir -p "$MASKS"
+# OPERATIONAL KNOBS, all off by default.
+#   START_STAGE  enter the pipeline at a later stage (re-select at a different ratio without
+#                re-running a 33-hour pass; also what makes the 3->7 chain rehearsable at all)
+#   ALLOW_DEAD   score only the domains that have routed mass (a deliberately partial pass)
+#   DRY_RUN      stage 7 plans the checkpoint instead of writing it
 
 echo stage3-criterion > logs/.stage
-if [ ! -f "$MASKS/comparison.json" ]; then
+if [ "$START_STAGE" -le 3 ] && [ ! -f "$MASKS/comparison.json" ]; then
   say "STAGE 3 criterion comparison at ratio $RATIO"
-  "$PY" scripts/criterion_compare.py --acc artifacts/saliency/accumulators.pt \
-        --out-dir "$MASKS" --ratio "$RATIO" >> "$LOG" 2>&1 \
+  "$PY" scripts/criterion_compare.py --acc "$ACC" \
+        --out-dir "$MASKS" --ratio "$RATIO" $DEAD_FLAG >> "$LOG" 2>&1 \
     || { say "STAGE 3 FAILED"; exit 1; }
 else
   say "STAGE 3 SKIPPED -- $MASKS/comparison.json exists"
@@ -101,10 +118,11 @@ MODE=$("$PY" -c "import json;r=json.load(open('$MASKS/comparison.json'));print(r
 say "STAGE 3 winner: $CRIT / $MODE"
 
 echo stage4-budget > logs/.stage
-if [ ! -f "$MASKS/layer_budget.json" ]; then
+if [ "$START_STAGE" -le 4 ] && [ ! -f "$MASKS/layer_budget.json" ]; then
   say "STAGE 4 per-layer budget search (EvoESAP), criterion $CRIT"
-  "$PY" scripts/layer_budget.py --acc artifacts/saliency/accumulators.pt \
+  "$PY" scripts/layer_budget.py --acc "$ACC" \
         --out "$MASKS/layer_budget.json" --ratio "$RATIO" --criterion "$CRIT" \
+        --generations "${GENERATIONS:-300}" $DEAD_FLAG \
     >> "$LOG" 2>&1 || { say "STAGE 4 FAILED"; exit 1; }
 else
   say "STAGE 4 SKIPPED -- $MASKS/layer_budget.json exists"
@@ -117,29 +135,38 @@ say "STAGE 4 gain over uniform: $("$PY" -c "import json;d=json.load(open('$MASKS
 say "STAGE 4 NOT APPLIED -- uniform budget keeps the checkpoint loadable; see layer_budget.py"
 
 echo stage5-select > logs/.stage
-if [ ! -f "$MASKS/mask.json" ]; then
+if [ "$START_STAGE" -le 5 ] && [ ! -f "$MASKS/mask.json" ]; then
   say "STAGE 5 expert selection: $CRIT / $MODE at $RATIO (uniform per-layer)"
-  "$PY" scripts/reap_select.py --acc artifacts/saliency/accumulators.pt \
-        --out "$MASKS/mask.json" --ratio "$RATIO" --mode "$MODE" --criterion "$CRIT" \
+  "$PY" scripts/reap_select.py --acc "$ACC" \
+        --out "$MASKS/mask.json" --ratio "$RATIO" --mode "$MODE" --criterion "$CRIT" $DEAD_FLAG \
     >> "$LOG" 2>&1 || { say "STAGE 5 FAILED"; exit 1; }
 else
   say "STAGE 5 SKIPPED -- $MASKS/mask.json exists"
 fi
 
 echo stage6-routerkd > logs/.stage
-if [ ! -f "$MASKS/router_kd.pt" ] || [ "${FORCE_KD:-0}" = "1" ]; then
+if [ "$START_STAGE" -le 6 ] && { [ ! -f "$MASKS/router_kd.pt" ] || [ "${FORCE_KD:-0}" = "1" ]; }; then
   # --force because this script IS reap_run.service: router_kd_run refuses to start
   # while that unit is active, which would otherwise make it refuse itself.
   say "STAGE 6 router KD (output matching, routers only)"
+  # BOUNDED. Left unbounded this streams every batch of a 2 M-token chunk through 48 layers on
+  # the GPU. Rehearsing it that way against the live calibration pass cost the pass a 228 s
+  # layer (normal ~90 s) and took MemAvailable to 28 GB -- so the knobs exist, and stage 6 is
+  # never to be exercised while stage 2 holds the device.
   "$PY" scripts/router_kd_run.py --chunks artifacts/chunks --mask "$MASKS/mask.json" \
-        --out "$MASKS" --force >> "$LOG" 2>&1 || { say "STAGE 6 FAILED"; exit 1; }
+        --out "$MASKS" --device "${KD_DEVICE:-cuda}" --tokens "${KD_TOKENS:-2048}" \
+        --steps "${KD_STEPS:-300}" --batch "${KD_BATCH:-512}" \
+        ${KD_MAX_LAYERS:+--max-layers $KD_MAX_LAYERS} \
+        ${KD_MAX_BATCHES:+--max-batches $KD_MAX_BATCHES} \
+        ${KD_MAX_SEQ:+--max-seq $KD_MAX_SEQ} \
+        --force >> "$LOG" 2>&1 || { say "STAGE 6 FAILED"; exit 1; }
 else
   say "STAGE 6 SKIPPED -- $MASKS/router_kd.pt exists"
 fi
 
 echo stage7-apply > logs/.stage
 DST=${REAP_DST:-$HOME/models/MiMo-V2.6-Flash-REAP$(printf '%.0f' "$(echo "$RATIO*100" | bc)")}
-if [ ! -f "$DST/config.json" ]; then
+if [ "$START_STAGE" -le 7 ] && [ ! -f "$DST/config.json" ]; then
   # The pruned checkpoint is written, never edited in place, so the source survives a failure --
   # and there must be room for it before a multi-hour copy discovers there is not.
   NEED=$(du -sm "$HOME/models/MiMo-V2.6-Flash-RL" | cut -f1)
@@ -150,7 +177,7 @@ if [ ! -f "$DST/config.json" ]; then
     exit 1
   fi
   "$PY" scripts/apply_mask.py --dst "$DST" --mask "$MASKS/mask.json" \
-        --router-kd "$MASKS/router_kd.pt" >> "$LOG" 2>&1 \
+        --router-kd "$MASKS/router_kd.pt" $DRY_FLAG >> "$LOG" 2>&1 \
     || { say "STAGE 7 FAILED"; exit 1; }
 else
   say "STAGE 7 SKIPPED -- $DST/config.json exists"
