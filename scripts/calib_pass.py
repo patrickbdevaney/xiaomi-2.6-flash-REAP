@@ -175,8 +175,15 @@ def run(src, chunks_dir, out_dir, device="cuda", dtype=torch.bfloat16,
                 f"{cfg.num_attention_heads * S * S * 2 / 2**30:.1f} GiB per forward. Run on CUDA "
                 f"so flex_attention handles the sink bias, or shorten the chunk.")
         masks = masks_for(S, cfg.sliding_window, device, dtype)
+        # PER-LAYER PROGRESS. Without this a chunk is silent for over an hour, and "slow" is
+        # indistinguishable from "wedged" -- which cost real time today: a 75-minute silence
+        # turned out to be the verifier rejecting a good chunk, but diagnosing that meant
+        # sampling page faults and mapped shards from /proc instead of reading a log line.
+        # It also turns the 27-chunk ETA into a measurement rather than arithmetic.
+        t_layer = time.time()
         for li in range(n_layers):
             layer = build_layer(cfg, li, reader, dtype).to(device)
+            t_build = time.time() - t_layer
             atype = layer.attention_type
             pos = torch.arange(S, device=device)[None]
             with torch.no_grad():
@@ -197,6 +204,13 @@ def run(src, chunks_dir, out_dir, device="cuda", dtype=torch.bfloat16,
             reader.release(); gc.collect()
             if device == "cuda":
                 torch.cuda.empty_cache()
+            dt = time.time() - t_layer
+            done_frac = (li + 1) / n_layers
+            eta = dt * 0 if done_frac == 0 else (time.time() - t0) * (1 - done_frac) / done_frac
+            print(f"  {cf.name} layer {li + 1:>2}/{n_layers} "
+                  f"{dt:6.1f}s (build {t_build:4.1f}s) | chunk {done_frac:5.1%} "
+                  f"eta {eta / 60:5.1f}m", flush=True)
+            t_layer = time.time()
         for st in states:
             st.pop("hs", None)          # free the activations before the next chunk loads
         # VERIFY *BEFORE* CHECKPOINTING -- and it means before, which the previous ordering did
