@@ -84,6 +84,39 @@ say "STAGE 2 rc=$RC"
 "$PY" scripts/verify_pass.py --out artifacts/saliency >> "$LOG" 2>&1 \
   && say "FINAL VERIFY PASS" || { say "FINAL VERIFY FAILED"; exit 1; }
 say "REAP calibration COMPLETE"
+
+# ---------------------------------------------------------------------------------------------
+# STAGE 2B -- video caption top-up. The video frames carry no text, so every clip in the built
+# corpus got the same fallback prompt and video reached 35.4% expert coverage (6.2% in its worst
+# layer) against audio's 59.2% on an identical token count. build_corpus now joins the real
+# captions; this appends one properly-captioned chunk and folds it in.
+#
+# APPEND, never rebuild: the accumulators are running sums and a sum cannot be un-folded, so
+# replacing the bad chunk would mean discarding the whole pass. It runs HERE, after stage 2, so
+# it never competes with the pass for the vision tower.
+# ---------------------------------------------------------------------------------------------
+TOPUP_MARK=artifacts/chunks/.video_topup_done
+if [ "${VIDEO_TOPUP:-1}" = "1" ] && [ "$START_STAGE" -le 2 ] && [ ! -f "$TOPUP_MARK" ]; then
+  echo stage2b-videotopup > logs/.stage
+  say "STAGE 2B video caption top-up (${TOPUP_TOKENS:-1500000} tokens)"
+  if "$PY" scripts/video_topup.py --out artifacts/chunks \
+       --tokens "${TOPUP_TOKENS:-1500000}" --force >> "$LOG" 2>&1; then
+    touch "$TOPUP_MARK"
+    say "STAGE 2B done; folding the new chunk into the accumulators"
+    "$PY" scripts/calib_pass.py --chunks artifacts/chunks --out artifacts/saliency \
+      >> "$LOG" 2>&1 || { say "STAGE 2B fold FAILED"; exit 1; }
+    "$PY" scripts/verify_pass.py --out artifacts/saliency >> "$LOG" 2>&1 \
+      && say "STAGE 2B verify PASS" || { say "STAGE 2B verify FAILED"; exit 1; }
+  else
+    # A top-up failure must not cost the pass. The corpus and accumulators are untouched on any
+    # error path in video_topup, so the right response is to carry on with what we have.
+    say "STAGE 2B FAILED -- continuing with the existing corpus (video stays at its measured"
+    say "  35.4% coverage; consider raising PROTECT_FRAC for stage 5)"
+    touch "$TOPUP_MARK"
+  fi
+elif [ -f "$TOPUP_MARK" ]; then
+  say "STAGE 2B SKIPPED -- already applied"
+fi
 else
   say "STAGES 1-2 SKIPPED -- START_STAGE=$START_STAGE"
 fi

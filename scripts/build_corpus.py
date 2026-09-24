@@ -375,6 +375,25 @@ class Packer:
 
 # ---------------------------------------------------------------- the build
 
+
+def video_samples(cfg, V, tok, E, oversize: dict | None = None):
+    """Yield (token ids, prepared clip) for video, ONE definition shared by the corpus build and
+    the caption top-up. Duplicating this loop is how the two would silently diverge -- the top-up
+    exists precisely because the text half of it was wrong."""
+    oversize = {} if oversize is None else oversize
+    for frames, text in iter_video_clips(ML.CLIP_FRAMES_VIDEO):
+        frames = ML.fit_frames(frames, cfg)
+        prep = V.prepare(frames)
+        # A clip is ONE attention chunk (grid is T,h,w and L = T*h*w), so the whole clip must fit
+        # the budget, not each frame.
+        if ML.patch_rows(prep["grid_thw"]) > ML.MAX_PATCH_ROWS:
+            oversize["video"] = oversize.get("video", 0) + 1
+            continue
+        n = V.n_tokens(prep)
+        ids = tok(text or "Describe this video.", add_special_tokens=False)["input_ids"]
+        yield ids + [E.ids["video"]] * n, prep
+
+
 def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
           tokens_per_chunk: int = 2_000_000, device: str = "cuda", limit_per_source: int = 0):
     """Fill every bucket to its TOKEN_TARGET share and write chunks."""
@@ -443,21 +462,9 @@ def build(src, out_dir, total_tokens: int, seq_len: int = 4096,
             src_list = {"image": SPEC.IMAGE_SOURCES, "audio": SPEC.AUDIO_SOURCES,
                         "video": SPEC.VIDEO_SOURCES}[bucket]
             if bucket == "video":
-                stream = iter_video_clips(ML.CLIP_FRAMES_VIDEO)
-                for frames, text in stream:
+                for ids, prep in video_samples(cfg, V, tok, E, oversize):
                     if got >= want[bucket]:
                         break
-                    frames = ML.fit_frames(frames, cfg)
-                    prep = V.prepare(frames)
-                    # A clip is ONE attention chunk (grid is T,h,w and L = T*h*w), so the whole
-                    # clip must fit the budget, not each frame.
-                    L = ML.patch_rows(prep["grid_thw"])
-                    if L > ML.MAX_PATCH_ROWS:
-                        oversize["video"] = oversize.get("video", 0) + 1
-                        continue
-                    n = V.n_tokens(prep)
-                    ids = tok(text or "Describe this video.", add_special_tokens=False)["input_ids"]
-                    ids = ids + [E.ids["video"]] * n
                     if len(ids) + 1 > P.room():
                         emit(force=True)
                     P.add(ids, pix=prep["pixel_values"], grid=prep["grid_thw"], kind="video")
