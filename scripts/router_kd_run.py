@@ -146,7 +146,7 @@ def _busy() -> str | None:
 
 def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16,
         tokens=2048, kept_cand=32, steps=300, lr=1e-3, batch=512, chunk_index=0, seed=0,
-        max_layers=None, max_batches=None):
+        max_layers=None, max_batches=None, max_seq=None):
     from transformers import AutoConfig
     src, out_dir = Path(src), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -167,6 +167,12 @@ def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16
     # been executed is not a stage that works.
     if max_batches:
         states = states[:max_batches]
+    if max_seq:
+        # Truncating the sequence is what makes a CPU rehearsal possible at all: eager attention
+        # on a 4096-token sequence is refused upstream for good reason, and the GPU belongs to
+        # the calibration pass. It changes what the routers see, never whether the code runs.
+        states = [{**st, "ids": st["ids"][:, :max_seq], "valid": st["valid"][:, :max_seq]}
+                  for st in states]
     S = states[0]["ids"].shape[1]
     masks = masks_for(S, cfg.sliding_window, device, dtype)
     pos = torch.arange(S, device=device)[None]
@@ -227,17 +233,27 @@ def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16
             cand_out = expert_outputs(layer.mlp.experts, hid, cand, dtype)
             r = RK.fit_layer(cand_out, t_slot, t_w, hid, W, B, keep, kept_slot, kept_local, K,
                              steps=steps, lr=lr, batch=batch, seed=seed + li)
+            # NEVER SHIP A ROUTER WORSE THAN THE ONE WE STARTED FROM. The teacher's sliced router
+            # is a valid, measured baseline; training is only justified where it beats it. This
+            # is not hypothetical: when the mask prunes only experts the corpus never routed to,
+            # the baseline loss is exactly zero and every gradient step can only move away from
+            # it. Falling back costs nothing and removes a whole class of silent regression.
+            if not (r["last"] < r["baseline"]):
+                r["w"], r["kept_teacher"] = W[keep].float().cpu(), True
+                r["last"] = r["baseline"]
             trained[name] = {"weight": r["w"].cpu(), "bias": r["b"].cpu(), "keep": keep.cpu()}
             res["layers"][name] = {k: r[k] for k in
                                    ("baseline", "first", "last", "boundary", "improvement")}
             res["layers"][name]["tokens"] = n
+            res["layers"][name]["kept_teacher"] = bool(r.get("kept_teacher", False))
             tmp = trained_path.with_suffix(".tmp")
             torch.save(trained, tmp); tmp.replace(trained_path)
             tmp2 = state_path.with_suffix(".tmp")
             tmp2.write_text(json.dumps(res, indent=1)); tmp2.replace(state_path)
             print(f"  layer {li:>2} kept {len(keep):>3}/{n_exp}  loss {r['baseline']:.4e} -> "
                   f"{r['last']:.4e} ({r['improvement']:+6.1%})  boundary {r['boundary']:.1%}  "
-                  f"n={n}  [{(time.time()-t0)/60:.1f}m]", flush=True)
+                  f"n={n}{'  [kept teacher]' if r.get('kept_teacher') else ''}  "
+                  f"[{(time.time()-t0)/60:.1f}m]", flush=True)
             del hid, cand, cand_out
         del layer
         CAP["hid"] = None
@@ -246,6 +262,11 @@ def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16
             torch.cuda.empty_cache()
 
     improved = [v["improvement"] for v in res["layers"].values()]
+    fellback = [k for k, v in res["layers"].items() if v.get("kept_teacher")]
+    if fellback:
+        print(f"note: {len(fellback)} of {len(res['layers'])} layers kept the teacher's sliced "
+              f"router because training did not beat it. That is the expected outcome wherever "
+              f"the mask prunes only experts the corpus never routed to.", flush=True)
     bad = [k for k, v in res["layers"].items() if v["boundary"] > 0.05]
     print(f"router KD done: {len(improved)} layers, mean improvement "
           f"{sum(improved)/max(len(improved),1):+.1%}, min {min(improved, default=0):+.1%}",
@@ -273,6 +294,8 @@ def main():
                     help="rehearsal only: stop after this many layers")
     ap.add_argument("--max-batches", type=int, default=None,
                     help="rehearsal only: stream only this many batches of the chunk")
+    ap.add_argument("--max-seq", type=int, default=None,
+                    help="rehearsal only: truncate each sequence to this length")
     ap.add_argument("--force", action="store_true",
                     help="run even while the calibration pass holds the GPU")
     a = ap.parse_args()
@@ -283,7 +306,8 @@ def main():
         return 2
     run(a.src, a.chunks, a.mask, a.out, device=a.device, tokens=a.tokens,
         kept_cand=a.kept_candidates, steps=a.steps, lr=a.lr, batch=a.batch,
-        chunk_index=a.chunk_index, max_layers=a.max_layers, max_batches=a.max_batches)
+        chunk_index=a.chunk_index, max_layers=a.max_layers, max_batches=a.max_batches,
+        max_seq=a.max_seq)
     return 0
 
 
