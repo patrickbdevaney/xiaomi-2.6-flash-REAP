@@ -98,8 +98,60 @@ def _row_text(row):
     return ""
 
 
+VIDEO_TEXT_FILES = (
+    "video_instruction/train/sft/video_caption_300k.jsonl",   # matches the train_300k frames
+    "video_instruction/train/qa/chatgpt_qa_240k.jsonl",       # QA, for prompt diversity
+)
+
+
+def video_captions(limit: int = 0) -> dict:
+    """{scene_id: text} for the video frames, loaded from the repo's SEPARATE instruction files.
+
+    THE FRAMES CARRY NO TEXT. Probed 2026-09-24, a row of
+    `ShareGPTVideo/train_video_and_instruction` is exactly `['jpeg', '__key__', '__url__']` --
+    there is no question, caption or instruction field anywhere in the split, so `_row_text`
+    correctly returned "" and EVERY clip fell back to the same literal prompt.
+
+    The cost was measured on the calibration pass: video reached 35.4% expert coverage (6.2% in
+    its worst layer, 16 of 256) against audio's 59.2% on an IDENTICAL token count. A bucket whose
+    every row carries the same 8 tokens of text cannot exercise the router, so the domain that
+    most needed evidence produced the least.
+
+    The instructions live in `video_instruction/*.jsonl`, keyed by scene id, and the join is
+    exact: frame `__key__` `./v_--0edUL8zmA-Scene-001/c01_0001` -> id `v_--0edUL8zmA-Scene-001`.
+    """
+    import json
+    from huggingface_hub import hf_hub_download
+    hid = SPEC.VIDEO_SOURCES[0][0]
+    out = {}
+    for rel in VIDEO_TEXT_FILES:
+        try:
+            path = hf_hub_download(hid, rel, repo_type="dataset")
+        except Exception as e:
+            print(f"    ! video text {rel} unavailable ({str(e)[:90]}); clips from it lose text",
+                  flush=True)
+            continue
+        with open(path) as fh:
+            for ln in fh:
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                vid = r.get("id") or r.get("video")
+                conv = r.get("conversations")
+                if not vid or not isinstance(conv, list):
+                    continue
+                txt = " ".join(c.get("value", "") for c in conv if isinstance(c, dict))
+                txt = txt.replace("<video>", " ").strip()
+                if txt:
+                    out.setdefault(str(vid), txt[:2000])
+                if limit and len(out) >= limit:
+                    break
+    return out
+
+
 def iter_video_clips(frames_per_clip: int):
-    """Regroup the frame webdataset into clips by `__key__` prefix.
+    """Regroup the frame webdataset into clips by `__key__` prefix, WITH their real captions.
 
     Frames arrive in order within a scene, so a clip is simply a run of consecutive rows sharing
     the directory part of the key. A scene shorter than `frames_per_clip` is skipped rather than
@@ -107,15 +159,21 @@ def iter_video_clips(frames_per_clip: int):
     """
     from datasets import load_dataset
     hid, cfgn, split, _ = SPEC.VIDEO_SOURCES[0]
+    caps = video_captions()
+    print(f"    video captions loaded: {len(caps):,} scenes", flush=True)
     ds = load_dataset(hid, cfgn, split=split, streaming=True)
-    cur_key, buf = None, []
+    cur_key, buf, hit, miss = None, [], 0, 0
     for row in ds:
         key = row["__key__"].rsplit("/", 1)[0]
         if key != cur_key:
             cur_key, buf = key, []
         buf.append(row["jpeg"].convert("RGB"))
         if len(buf) == frames_per_clip:
-            yield buf, ""
+            txt = caps.get(key.lstrip("./"), "")
+            hit, miss = hit + bool(txt), miss + (not txt)
+            if (hit + miss) % 200 == 0:
+                print(f"    video text: {hit}/{hit+miss} clips captioned", flush=True)
+            yield buf, txt
             buf = []
 
 
