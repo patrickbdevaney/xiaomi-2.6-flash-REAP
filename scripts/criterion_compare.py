@@ -19,13 +19,17 @@ import reap_select as RS
 
 
 def compare(acc: Path, ratio: float, out_dir: Path, modes=("reap", "hope"),
-            criteria=None, protect_frac: float = 0.0) -> list:
+            criteria=None, protect_frac: float = 0.0, allow_dead: bool = False) -> list:
     criteria = criteria or list(RS.CRITERIA)
+    _acc, _fs, _fc, _bk = RS.load_acc(acc)
+    RS.assert_domains_live(_acc, _bk, "criterion comparison", allow_dead)
+    del _acc, _fs, _fc
     rows = []
     for crit in criteria:
         for mode in modes:
             out = out_dir / f"mask_{crit}_{mode}.json"
-            r = RS.run(acc, out, ratio, mode, crit, protect_frac=protect_frac)
+            r = RS.run(acc, out, ratio, mode, crit, protect_frac=protect_frac,
+                       allow_dead=allow_dead)
             rows.append(r)
     rows.sort(key=lambda r: -r["worst_retention"])
     return rows
@@ -63,8 +67,11 @@ if __name__ == "__main__":
     ap.add_argument("--out-dir", default="artifacts/masks")
     ap.add_argument("--ratio", type=float, default=0.50)
     ap.add_argument("--protect-frac", type=float, default=0.0)
+    ap.add_argument("--allow-dead-domains", action="store_true",
+                    help="rank using only the domains that have mass")
     a = ap.parse_args()
-    rows = compare(Path(a.acc), a.ratio, Path(a.out_dir), protect_frac=a.protect_frac)
+    rows = compare(Path(a.acc), a.ratio, Path(a.out_dir), protect_frac=a.protect_frac,
+                   allow_dead=a.allow_dead_domains)
     txt = render(rows)
     print(txt)
     Path(a.out_dir).mkdir(parents=True, exist_ok=True)

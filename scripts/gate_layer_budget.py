@@ -78,7 +78,7 @@ with tempfile.TemporaryDirectory() as td:
           set(r["searched_by_domain"]) == {"x", "y"}, str(r["searched_by_domain"]))
 
     print("\n[5] a budget that cheats the total is rejected by construction")
-    tab, _ = LB._layer_tables(td / "accumulators.pt", "total_0_1_1")
+    tab, _, _live = LB._layer_tables(td / "accumulators.pt", "total_0_1_1")
     cheat = np.array([2, 2])          # prunes far fewer than required
     f_cheat, _ = LB.fitness(tab, cheat)
     f_true, _ = LB.fitness(tab, np.array([r["budget"]["model.layers.1.mlp"],

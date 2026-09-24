@@ -59,9 +59,10 @@ import numpy as np
 import reap_select as RS
 
 
-def _layer_tables(acc_path: Path, criterion: str):
+def _layer_tables(acc_path: Path, criterion: str, allow_dead: bool = False):
     """Per-layer (scores, domain mass, F) -- computed once, reused by every candidate."""
     acc, f_sum, f_cnt, buckets = RS.load_acc(acc_path)
+    live = RS.assert_domains_live(acc, buckets, "layer budget search", allow_dead)["live_mask"]
     names = sorted(acc, key=RS.layer_index)
     tab = []
     for n in names:
@@ -74,23 +75,28 @@ def _layer_tables(acc_path: Path, criterion: str):
             "F": (f_sum[li] / f_cnt[li].clamp(min=1)).numpy(),
             "n_exp": a["cnt"].shape[1],
         })
-    return tab, buckets
+    return tab, buckets, live
 
 
-def fitness(tab, budget: np.ndarray, mode: str = "reap") -> tuple:
-    """-> (worst-domain retention, per-domain retention vector)."""
+def fitness(tab, budget: np.ndarray, mode: str = "reap", live=None) -> tuple:
+    """-> (worst-domain retention, per-domain retention vector).
+
+    `live` masks out domains with no routed mass. Without it a single empty domain pins the
+    objective at zero for every candidate and the search silently returns its starting point.
+    """
     rets = []
     for t, k in zip(tab, budget):
         pruned = RS.select_layer(t["F"], t["scores"], int(k), mode)
         rets.append(RS.retention(t["mass"], pruned))
     R = np.stack(rets)                        # [n_layer, n_bucket]
     per_domain = R.mean(0)
-    return float(per_domain.min()), per_domain
+    scored = per_domain if live is None else np.where(live, per_domain, np.inf)
+    return float(scored.min()), per_domain
 
 
 def search(tab, total_prune: int, n_exp: int, generations: int = 300, pop: int = 16,
            seed: int = 0, min_frac: float = 0.20, max_frac: float = 0.75,
-           mode: str = "reap") -> tuple:
+           mode: str = "reap", live=None) -> tuple:
     """Evolutionary search over integer per-layer budgets with a fixed sum.
 
     `min_frac`/`max_frac` bound each layer. Without them the search will happily strip one layer
@@ -124,7 +130,7 @@ def search(tab, total_prune: int, n_exp: int, generations: int = 300, pop: int =
     population = [repair(base.copy())]
     for _ in range(pop - 1):
         population.append(repair(base + rng.integers(-3, 4, L)))
-    scored = [(fitness(tab, p, mode)[0], p) for p in population]
+    scored = [(fitness(tab, p, mode, live)[0], p) for p in population]
     scored.sort(key=lambda t: -t[0])
     best0 = scored[0][0]
 
@@ -138,7 +144,7 @@ def search(tab, total_prune: int, n_exp: int, generations: int = 300, pop: int =
             child[i] += amt
             child[j] -= amt
         child = repair(child)
-        f = fitness(tab, child, mode)[0]
+        f = fitness(tab, child, mode, live)[0]
         if f > scored[-1][0]:
             scored[-1] = (f, child)
             scored.sort(key=lambda t: -t[0])
@@ -146,13 +152,14 @@ def search(tab, total_prune: int, n_exp: int, generations: int = 300, pop: int =
 
 
 def run(acc_path: Path, out_path: Path, ratio: float, criterion: str,
-        generations: int, verify_with_hope: bool = False) -> dict:
-    tab, buckets = _layer_tables(acc_path, criterion)
+        generations: int, verify_with_hope: bool = False,
+        allow_dead: bool = False) -> dict:
+    tab, buckets, live = _layer_tables(acc_path, criterion, allow_dead)
     n_exp = tab[0]["n_exp"]
     total = int(round(len(tab) * n_exp * ratio))
-    budget, best, uniform = search(tab, total, n_exp, generations=generations)
-    _, per_dom = fitness(tab, budget)
-    _, per_dom_u = fitness(tab, np.full(len(tab), total // len(tab)))
+    budget, best, uniform = search(tab, total, n_exp, generations=generations, live=live)
+    _, per_dom = fitness(tab, budget, live=live)
+    _, per_dom_u = fitness(tab, np.full(len(tab), total // len(tab)), live=live)
     res = {
         "criterion": criterion, "ratio": ratio,
         "total_pruned": int(budget.sum()), "total_required": total,
@@ -164,7 +171,7 @@ def run(acc_path: Path, out_path: Path, ratio: float, criterion: str,
         "budget": {t["name"]: int(k) for t, k in zip(tab, budget)},
     }
     if verify_with_hope:
-        h, hd = fitness(tab, budget, mode="hope")
+        h, hd = fitness(tab, budget, mode="hope", live=live)
         res["hope_worst_on_searched_budget"] = float(h)
         res["hope_by_domain"] = {b: float(v) for b, v in zip(buckets, hd)}
     if out_path:
@@ -181,8 +188,11 @@ if __name__ == "__main__":
     ap.add_argument("--criterion", default="reap_1_1_1", choices=list(RS.CRITERIA))
     ap.add_argument("--generations", type=int, default=300)
     ap.add_argument("--verify-with-hope", action="store_true")
+    ap.add_argument("--allow-dead-domains", action="store_true",
+                    help="score only the domains that have mass (a partial pass)")
     a = ap.parse_args()
-    r = run(Path(a.acc), Path(a.out), a.ratio, a.criterion, a.generations, a.verify_with_hope)
+    r = run(Path(a.acc), Path(a.out), a.ratio, a.criterion, a.generations,
+            a.verify_with_hope, allow_dead=a.allow_dead_domains)
     print(json.dumps({k: v for k, v in r.items() if k != "budget"}, indent=1))
     print(f"total pruned {r['total_pruned']} (required {r['total_required']}) "
           f"| uniform {r['uniform_worst']:.4f} -> searched {r['searched_worst']:.4f} "

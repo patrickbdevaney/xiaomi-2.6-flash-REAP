@@ -146,6 +146,26 @@ with tempfile.TemporaryDirectory() as td:
     check("protected run still prunes the full count",
           all(v == 8 for v in rp["pruned_per_layer"].values()), str(rp["pruned_per_layer"]))
 
+# ---- the dead-domain guard: a worst-domain objective with an empty domain is degenerate ----
+bk_d = ["live_a", "live_b", "dead_c"]
+acc_d = {"model.layers.1.mlp": {
+    "sum": torch.tensor([[3.0, 1.0, 2.0, 4.0], [2.0, 5.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0]]),
+    "sq": torch.ones(3, 4), "cnt": torch.ones(3, 4)}}
+try:
+    RS.assert_domains_live(acc_d, bk_d, "gate")
+    check("a domain with zero mass is refused", False, "no error raised")
+except RS.DeadDomainError as e:
+    check("a domain with zero mass is refused", "dead_c" in str(e), "names the dead domain")
+info = RS.assert_domains_live(acc_d, bk_d, "gate", allow_dead=True)
+check("allow_dead reports which domains are actually scored",
+      info["live"] == ["live_a", "live_b"] and list(info["live_mask"]) == [True, True, False],
+      f"live {info['live']}, dead {info['dead']}")
+# a guard that always fires is no guard
+ok = RS.assert_domains_live(
+    {"model.layers.1.mlp": {"sum": torch.ones(3, 4), "sq": torch.ones(3, 4),
+                            "cnt": torch.ones(3, 4)}}, bk_d, "gate")
+check("the guard does not fire when every domain has mass", ok["dead"] == [], "no false positive")
+
 print("\n" + ("GATE FAIL: " + ", ".join(FAIL) if FAIL else
               "GATE PASS: selection is correct on cases with known answers"))
 sys.exit(1 if FAIL else 0)

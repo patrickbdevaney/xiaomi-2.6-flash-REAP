@@ -83,6 +83,41 @@ def domain_mass(a: dict) -> np.ndarray:
     return a["sum"].numpy()
 
 
+
+class DeadDomainError(RuntimeError):
+    pass
+
+
+def assert_domains_live(acc: dict, buckets: list, where: str, allow_dead: bool = False) -> dict:
+    """Refuse to rank or search against a domain that has seen no tokens.
+
+    Every objective here is WORST-DOMAIN retention. A domain with zero mass retains zero under
+    every candidate, so the worst is identically zero, every candidate ties, and the search
+    degenerates to its starting point -- while printing a full report and a ranked table. This
+    was not hypothetical: run against the first two chunks of the pass, eight of nine domains
+    read exactly 0.000 and `criterion_compare` still declared a winner ("BEST BY WORST DOMAIN:
+    reap_1_1_1 -- worst = code at 0.000"), which is a coin flip wearing a table.
+
+    A partial pass is the normal way to hit this, so the error says which domains and what to do
+    rather than just failing.
+    """
+    import numpy as np
+    mass = np.zeros(len(buckets))
+    for a in acc.values():
+        mass += a["sum"].numpy().sum(axis=1)
+    dead = [buckets[i] for i in range(len(buckets)) if mass[i] <= 0]
+    if dead and not allow_dead:
+        raise DeadDomainError(
+            f"{where}: {len(dead)} of {len(buckets)} domains have zero routed mass ({', '.join(dead)}). "
+            f"Worst-domain objectives are identically zero when any domain is empty, so the "
+            f"result would be arbitrary rather than wrong-looking. This is what a PARTIAL "
+            f"calibration pass looks like -- wait for those buckets' chunks, or pass "
+            f"--allow-dead-domains to score only the live ones and accept that the answer does "
+            f"not cover {', '.join(dead[:4])}.")
+    return {"mass": mass, "dead": dead, "live_mask": mass > 0,
+            "live": [b for b in buckets if b not in set(dead)]}
+
+
 def select_layer(F: np.ndarray, s: np.ndarray, n_prune: int, mode: str,
                  protect=None) -> np.ndarray:
     """-> indices to PRUNE."""
@@ -108,8 +143,9 @@ def retention(mass: np.ndarray, pruned: np.ndarray) -> np.ndarray:
 
 
 def run(acc_path: Path, out_path: Path, ratio: float, mode: str, crit: str,
-        bucket_weights=None, protect_frac: float = 0.0) -> dict:
+        bucket_weights=None, protect_frac: float = 0.0, allow_dead: bool = False) -> dict:
     acc, f_sum, f_cnt, buckets = load_acc(acc_path)
+    live = assert_domains_live(acc, buckets, "selection", allow_dead)["live_mask"]
     per_layer, ret_by_layer = {}, []
     for name in sorted(acc, key=layer_index):
         li = layer_index(name)
@@ -131,14 +167,18 @@ def run(acc_path: Path, out_path: Path, ratio: float, mode: str, crit: str,
         ret_by_layer.append(retention(domain_mass(a), pruned))
     R = np.stack(ret_by_layer)                      # [n_layer, n_bucket]
     per_domain = R.mean(0)
+    # The WORST is taken over live domains only. A dead domain retains zero under every
+    # candidate, so including it would make every option tie at zero -- see assert_domains_live.
+    scored = np.where(live, per_domain, np.inf)
     result = {
         "criterion": crit, "mode": mode, "ratio": ratio,
         "protect_frac": protect_frac,
         "buckets": buckets,
         "retention_by_domain": {b: float(v) for b, v in zip(buckets, per_domain)},
-        "worst_domain": buckets[int(np.argmin(per_domain))],
-        "worst_retention": float(per_domain.min()),
-        "mean_retention": float(per_domain.mean()),
+        "worst_domain": buckets[int(np.argmin(scored))],
+        "worst_retention": float(scored.min()),
+        "mean_retention": float(per_domain[live].mean()),
+        "scored_domains": [b for b, m in zip(buckets, live) if m],
         "layers": len(per_layer),
         "pruned_per_layer": {k: len(v) for k, v in per_layer.items()},
     }
