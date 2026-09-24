@@ -1,0 +1,271 @@
+"""Full-model driver for router repair. Streams the layers; trains one router per MoE layer.
+
+WHY THIS IS A SECOND PASS AND NOT A HEAD ON THE FIRST
+-----------------------------------------------------
+The objective needs the MoE's INPUT (post-attention hidden states) and the outputs of experts
+the teacher did NOT select -- the kept experts the student might substitute. The calibration
+pass computes neither: it only ever evaluates the teacher's top-8. Folding this in would have
+made a 33-hour pass materially longer and coupled the run's survival to code that had not been
+gated yet, so it runs afterwards, over a small token budget, when the GPU is free.
+
+THE TOKEN BUDGET IS SMALL ON PURPOSE
+------------------------------------
+Only `n_kept * hidden` parameters are fit per layer -- for a 50% prune, 128 x 4096. A few
+thousand tokens is a large sample for that, and the memory cost is the binding constraint:
+`cand_out` is [N, C, H] in bf16, which at N=2048, C=32 is 537 MB and at N=16384 would be 4.3 GB
+on top of a resident layer, on a box that has been OOM-killed four times in this project.
+
+The forward itself, however, CANNOT be subsampled: hidden states at layer L require the full
+sequence through layers 0..L-1, because attention is not token-separable. So a whole chunk is
+streamed and the subsample is drawn from it -- the cost is one chunk's forward, about the same
+as one calibration chunk.
+
+RESUMABLE, because it is 47 independent problems and there is no reason to lose 46 of them.
+"""
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).parent))
+import router_kd as RK                                    # noqa: E402
+from calib_pass import build_layer, _modeling, masks_for, _rope  # noqa: E402
+from mimo_shards import ShardReader                       # noqa: E402
+
+CAP = {"hid": None, "valid": None, "budget": 0, "seen": 0, "gen": None}
+
+
+def _reservoir_fast(h: torch.Tensor) -> None:
+    """Reservoir-sample the MoE's input rows into CAP["hid"], vectorised.
+
+    Uniform over the WHOLE chunk rather than the first N rows of the first batch -- which would
+    be one domain, and the corpus is deliberately nine of them. Row i of a batch, with n rows
+    already seen, keeps with probability B/(n+i+1), which is the standard reservoir rule applied
+    to a whole batch at once instead of one row at a time.
+    """
+    buf, B, n = CAP["hid"], CAP["budget"], CAP["seen"]
+    m = h.shape[0]
+    if n < B:
+        take = min(B - n, m)
+        buf[n:n + take] = h[:take]
+        CAP["seen"] = n + take
+        h, n, m = h[take:], n + take, m - take
+        if m == 0:
+            return
+    # For each remaining row i (0-based within this batch) the reservoir index is uniform over
+    # [0, n+i]; keep it if it lands inside the buffer.
+    idx = n + torch.arange(m, device=h.device)
+    j = (torch.rand(m, generator=CAP["gen"], device="cpu").to(h.device) * (idx + 1).float()).long()
+    hit = j < B
+    if bool(hit.any()):
+        buf[j[hit].cpu()] = h[hit].to(buf.dtype).cpu()
+    CAP["seen"] = n + m
+
+
+def candidates(hid, W, B, keep, top_k, n_kept_cand):
+    """(cand[N,C], t_slot[N,k], t_w[N,k], kept_slot[N,CK], kept_local[N,CK]).
+
+    cand = teacher's top-k, then the CK highest-scoring KEPT experts. The teacher's slots are
+    therefore 0..k-1 by construction, and the kept block is a fixed CK wide so the student always
+    has the same number of options -- see the gate, where building candidates before pruning left
+    9 kept options for a top-8 choice and pinned the student to the boundary.
+    """
+    with torch.no_grad():
+        scores = torch.sigmoid(hid.float() @ W.float().T)
+        choice = scores + B.float()
+    keep_sorted = torch.sort(keep).values
+    _, t_idx = torch.topk(choice, top_k, dim=-1)
+    t_w = scores.gather(1, t_idx)
+    t_w = t_w / (t_w.sum(-1, keepdim=True) + 1e-20)
+    ck = min(n_kept_cand, len(keep_sorted))
+    kept_top = keep_sorted.to(hid.device)[torch.topk(choice[:, keep_sorted], ck, dim=-1).indices]
+    cand = torch.cat([t_idx, kept_top], dim=-1)
+    local_of = torch.full((W.shape[0],), -1, dtype=torch.long, device=hid.device)
+    local_of[keep_sorted.to(hid.device)] = torch.arange(len(keep_sorted), device=hid.device)
+    N = hid.shape[0]
+    t_slot = torch.arange(top_k, device=hid.device).expand(N, top_k).contiguous()
+    kept_slot = torch.arange(top_k, top_k + ck, device=hid.device).expand(N, ck).contiguous()
+    return cand, t_slot, t_w, kept_slot, local_of[kept_top]
+
+
+def expert_outputs(experts, hid, cand, dtype):
+    """cand_out[N, C, H], computing each (token, expert) pair ONCE.
+
+    An expert that appears at two candidate slots for the same token must produce the same value
+    at both, or the teacher's lookup and the student's lookup disagree about the same expert --
+    the failure the gate caught when its fixture drew fresh noise per slot.
+    """
+    N, C = cand.shape
+    out = torch.zeros(N, C, hid.shape[-1], dtype=dtype, device=hid.device)
+    for e in torch.unique(cand).tolist():
+        m = cand == e
+        toks = m.any(1).nonzero(as_tuple=True)[0]
+        y = experts[e](hid[toks].to(dtype))
+        pos = torch.full((N,), -1, dtype=torch.long, device=hid.device)
+        pos[toks] = torch.arange(len(toks), device=hid.device)
+        ns, cs = m.nonzero(as_tuple=True)
+        out[ns, cs] = y[pos[ns]]
+    return out
+
+
+def load_keep(mask_path: Path, n_exp: int) -> dict[int, torch.Tensor]:
+    d = json.loads(Path(mask_path).read_text())
+    mask = d.get("mask", d)
+    keep = {}
+    for k, v in mask.items():
+        li = int(k.split(".")[2])
+        drop = set(int(i) for i in v)
+        keep[li] = torch.tensor([e for e in range(n_exp) if e not in drop], dtype=torch.long)
+    return keep
+
+
+def _busy() -> str | None:
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-active", "reap_run.service"],
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() if r.stdout.strip() == "active" else None
+    except Exception:
+        return None
+
+
+def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16,
+        tokens=2048, kept_cand=32, steps=300, lr=1e-3, batch=512, chunk_index=0, seed=0):
+    from transformers import AutoConfig
+    src, out_dir = Path(src), Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg = AutoConfig.from_pretrained(src, trust_remote_code=True)
+    assert cfg.n_group == 1 and cfg.topk_group == 1, (
+        f"n_group={cfg.n_group} topk_group={cfg.topk_group}: this checkpoint uses group-limited "
+        f"routing, which pruning leaves ragged. gate_forward does not implement the group mask.")
+    n_layers, n_exp, K = cfg.num_hidden_layers, cfg.n_routed_experts, cfg.num_experts_per_tok
+    keep_by_layer = load_keep(Path(mask_path), n_exp)
+    reader = ShardReader(src)
+
+    chunk_files = sorted(Path(chunks_dir).glob("chunk_*.pt"))
+    cf = chunk_files[chunk_index]
+    states = torch.load(cf, map_location="cpu")
+    S = states[0]["ids"].shape[1]
+    masks = masks_for(S, cfg.sliding_window, device, dtype)
+    pos = torch.arange(S, device=device)[None]
+
+    state_path = out_dir / "router_kd_state.json"
+    res = json.loads(state_path.read_text()) if state_path.exists() else {"layers": {}}
+    trained_path = out_dir / "router_kd.pt"
+    trained = torch.load(trained_path, map_location="cpu") if trained_path.exists() else {}
+
+    mod = _modeling(cfg)
+    emb = None
+    print(f"router KD over {cf.name}: {len(states)} batches x {S} tokens, "
+          f"budget {tokens} rows, {kept_cand} kept candidates, {steps} steps", flush=True)
+
+    t0 = time.time()
+    for li in range(n_layers):
+        layer = build_layer(cfg, li, reader, dtype).to(device)
+        is_moe = hasattr(layer.mlp, "experts")
+        name = f"model.layers.{li}.mlp"
+        want = is_moe and li in keep_by_layer and name not in res["layers"]
+
+        CAP.update({"budget": tokens if want else 0, "seen": 0,
+                    "gen": torch.Generator().manual_seed(seed + li),
+                    "hid": torch.zeros(tokens, cfg.hidden_size, dtype=torch.float32)
+                           if want else None})
+        handle = None
+        if want:
+            handle = layer.mlp.register_forward_pre_hook(
+                lambda m, a: _reservoir_fast(
+                    a[0].detach().reshape(-1, a[0].shape[-1])[CAP["valid"]]
+                    if CAP["valid"] is not None
+                    else a[0].detach().reshape(-1, a[0].shape[-1])))
+        with torch.no_grad():
+            for st in states:
+                CAP["valid"] = st["valid"].to(device).reshape(-1) if want else None
+                if li == 0:
+                    if emb is None:
+                        emb = reader.get("model.embed_tokens.weight").to(device, dtype)
+                    hs = torch.nn.functional.embedding(st["ids"].to(device), emb)
+                else:
+                    hs = st["hs"].to(device, dtype)
+                pe = _rope(cfg, layer.attention_type, hs, pos, device, dtype)
+                out = layer(hs, attention_mask=masks[layer.attention_type],
+                            position_ids=pos, position_embeddings=pe)
+                st["hs"] = out.to("cpu", torch.bfloat16)
+                del hs, out
+        if handle is not None:
+            handle.remove()
+        CAP["valid"] = None
+
+        if want:
+            n = min(CAP["seen"], tokens)
+            hid = CAP["hid"][:n].to(device, dtype)
+            W = layer.mlp.gate.weight.detach().to(device)
+            B = layer.mlp.gate.e_score_correction_bias.detach().to(device)
+            keep = keep_by_layer[li].to(device)
+            cand, t_slot, t_w, kept_slot, kept_local = candidates(hid, W, B, keep, K, kept_cand)
+            cand_out = expert_outputs(layer.mlp.experts, hid, cand, dtype)
+            r = RK.fit_layer(cand_out, t_slot, t_w, hid, W, B, keep, kept_slot, kept_local, K,
+                             steps=steps, lr=lr, batch=batch, seed=seed + li)
+            trained[name] = {"weight": r["w"].cpu(), "bias": r["b"].cpu(), "keep": keep.cpu()}
+            res["layers"][name] = {k: r[k] for k in
+                                   ("baseline", "first", "last", "boundary", "improvement")}
+            res["layers"][name]["tokens"] = n
+            tmp = trained_path.with_suffix(".tmp")
+            torch.save(trained, tmp); tmp.replace(trained_path)
+            tmp2 = state_path.with_suffix(".tmp")
+            tmp2.write_text(json.dumps(res, indent=1)); tmp2.replace(state_path)
+            print(f"  layer {li:>2} kept {len(keep):>3}/{n_exp}  loss {r['baseline']:.4e} -> "
+                  f"{r['last']:.4e} ({r['improvement']:+6.1%})  boundary {r['boundary']:.1%}  "
+                  f"n={n}  [{(time.time()-t0)/60:.1f}m]", flush=True)
+            del hid, cand, cand_out
+        del layer
+        CAP["hid"] = None
+        reader.release(); gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    improved = [v["improvement"] for v in res["layers"].values()]
+    bad = [k for k, v in res["layers"].items() if v["boundary"] > 0.05]
+    print(f"router KD done: {len(improved)} layers, mean improvement "
+          f"{sum(improved)/max(len(improved),1):+.1%}, min {min(improved, default=0):+.1%}",
+          flush=True)
+    if bad:
+        print(f"WARNING: {len(bad)} layers sat on the candidate boundary (>5%); raise "
+              f"--kept-candidates and rerun them: {bad[:6]}", flush=True)
+    return res
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--src", default="/home/patrickd/models/MiMo-V2.6-Flash-RL")
+    ap.add_argument("--chunks", default="artifacts/chunks")
+    ap.add_argument("--mask", default="artifacts/masks/mask.json")
+    ap.add_argument("--out", default="artifacts/masks")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--tokens", type=int, default=2048)
+    ap.add_argument("--kept-candidates", type=int, default=32)
+    ap.add_argument("--steps", type=int, default=300)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--batch", type=int, default=512)
+    ap.add_argument("--chunk-index", type=int, default=0)
+    ap.add_argument("--force", action="store_true",
+                    help="run even while the calibration pass holds the GPU")
+    a = ap.parse_args()
+    if _busy() and not a.force:
+        print("REFUSING: reap_run.service is active. Router KD streams all 48 layers and would "
+              "contend for memory with the calibration pass -- which has been OOM-killed four "
+              "times in this project. Wait for it, or pass --force.")
+        return 2
+    run(a.src, a.chunks, a.mask, a.out, device=a.device, tokens=a.tokens,
+        kept_cand=a.kept_candidates, steps=a.steps, lr=a.lr, batch=a.batch,
+        chunk_index=a.chunk_index)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
