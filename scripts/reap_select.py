@@ -37,6 +37,7 @@ reports is therefore per bucket, and the summary line is the WORST domain, not t
 from __future__ import annotations
 
 import argparse
+import os
 import json
 from pathlib import Path
 
@@ -210,6 +211,18 @@ if __name__ == "__main__":
     ap.add_argument("--allow-dead-domains", action="store_true",
                     help="score only the domains that have routed mass")
     a = ap.parse_args()
+    # LATE-BINDING OVERRIDE. run_reap.sh is a 30-hour bash process: it expanded PROTECT_FRAC at
+    # launch and its script text is pinned to the inode it started from, so a value decided
+    # mid-run cannot reach it through the environment or through an edit of that file. Python
+    # scripts, by contrast, are read fresh at each invocation -- so the override lands HERE,
+    # where stage 5 actually starts. It beats the CLI on purpose; that is the whole point, and
+    # it is loud about it so a mask can never quietly carry a value nobody chose.
+    ovr = Path(os.environ.get("PROTECT_FRAC_FILE", "conf/protect_frac_override.txt"))
+    if ovr.exists():
+        v = float(ovr.read_text().split("#")[0].strip())
+        if v != a.protect_frac:
+            print(f"protect-frac OVERRIDE {a.protect_frac} -> {v} (from {ovr})", flush=True)
+        a.protect_frac = v
     r = run(Path(a.acc), Path(a.out), a.ratio, a.mode, a.criterion,
             protect_frac=a.protect_frac, allow_dead=a.allow_dead_domains)
     print(json.dumps(r, indent=1))

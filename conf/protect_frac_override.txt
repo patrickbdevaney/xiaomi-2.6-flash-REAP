@@ -1,0 +1,25 @@
+0.08  # measured 2026-09-25 on the 23/27-chunk accumulators, all 9 domains live, mode=hope.
+#
+#  pf     protected/layer   worst-domain retention      mean      pFp (HOPE objective)
+#  0.00        0.0          0.98713  image             0.99231    0.015320
+#  0.02       10.1          0.98760  image             0.99329    0.015326   +0.04%
+#  0.05       22.3          0.99005  video             0.99484    0.015369   +0.32%
+#  0.06       27.4          0.99125  image             0.99522    0.015380   +0.39%
+#  0.08       35.4          0.99392  audio             0.99653    0.015497   +1.15%   <-- knee
+#  0.10       42.8          0.99592  audio             0.99774    0.015660   +2.2%
+#  0.12       50.1          0.99739  audio             0.99842    0.015890   +3.7%
+#  0.16       64.2          0.99866  audio             0.99914    0.016470   +7.5%
+#  0.20       79.0          0.99920  math              0.99958    0.017450  +13.9%
+#
+#  0.08 buys 53% of the worst domain's residual loss (0.98713 -> 0.99392) for 1.15% of HOPE's
+#  own objective. Marginal efficiency falls off a cliff immediately after: 0.0059 retention
+#  points per 1% of pFp up to 0.08, 0.0019 from 0.08->0.10, 0.0002 from 0.12->0.20. It fixes
+#  35 of the 128 kept slots per layer by per-domain mass and leaves 93 to HOPE.
+#  0.01 is WORSE than 0 (0.98664) -- too few protected experts constrain the greedy without
+#  covering anything. Do not treat this curve as monotone near zero.
+#
+#  WHY THIS FILE AND NOT run_reap.sh: the pass was 26 h into a 30 h run when this was decided.
+#  bash reads a script incrementally from the inode it started with, so editing run_reap.sh in
+#  place shifts every byte the running shell has not read yet -- it would resume mid-line. Its
+#  default therefore stays 0 until the run ends; this file is what stage 5 actually reads.
+#  Gated by scripts/gate_protect_override.py.
