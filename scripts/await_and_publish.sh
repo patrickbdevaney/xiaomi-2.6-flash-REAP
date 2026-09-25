@@ -58,10 +58,10 @@ for try in $(seq 1 "$MAX_TRIES"); do
   say "upload attempt $try/$MAX_TRIES -> $REPO"
   status "uploading (attempt $try/$MAX_TRIES)"
   if "$PY" scripts/publish_hf.py --dst "$DST" --repo "$REPO" $PUBLIC_FLAG >> "$LOG" 2>&1; then
-    say "PUBLISHED: https://huggingface.co/$REPO"
-    [ -z "$PUBLIC_FLAG" ] && say "  it is PRIVATE. To make it public, deliberately:" \
-      && say "  hf repo settings $REPO --private=false"
-    status "published https://huggingface.co/$REPO $([ -z "$PUBLIC_FLAG" ] && echo '(private)')"
+    vis=$([ -n "$PUBLIC_FLAG" ] && echo PUBLIC || echo private)
+    say "PUBLISHED ($vis): https://huggingface.co/$REPO"
+    [ -z "$PUBLIC_FLAG" ] && say "  to make it public: hf repo settings $REPO --private=false"
+    status "published $vis https://huggingface.co/$REPO"
     exit 0
   fi
   # upload_large_folder resumes from what already landed, so a retry is cheap and a dropped

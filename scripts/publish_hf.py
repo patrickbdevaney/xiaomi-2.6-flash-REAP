@@ -6,9 +6,10 @@ secretly a copy of the source, or a model that cannot chat because one small fil
 carried over are all things that LOOK fine in a directory listing. So every check below is a
 refusal, not a warning, and the upload is the last thing that happens.
 
-The repo is created PRIVATE. Making weights public is the one step here that cannot be undone,
-and it costs a single command to do deliberately:
-    hf repo settings <repo> --private=false
+Visibility is a deliberate choice, not a default: publishing weights cannot be undone. This
+pipeline runs with --public (set in reap-publish.service) because a ~100 GB checkpoint does not
+fit the free tier's PRIVATE storage quota -- private would mean the upload fails, not that it
+stays safe. Drop HF_PUBLIC from the unit to go back to a private repo.
 """
 from __future__ import annotations
 import argparse
@@ -249,6 +250,11 @@ def main() -> int:
     who = api.whoami()["name"]
     print(f"authenticated as {who}", flush=True)
     api.create_repo(a.repo, repo_type="model", private=not a.public, exist_ok=True)
+    if a.public:
+        # exist_ok=True does NOT change the visibility of a repo that already exists, so a repo
+        # created private by an earlier attempt would stay private and the upload would fail
+        # against the free tier's private quota with no obvious cause. Say it outright.
+        api.update_repo_settings(a.repo, repo_type="model", private=False)
     print(f"uploading {pre['bytes']/2**30:.1f} GiB to {a.repo} "
           f"({'PUBLIC' if a.public else 'private'})", flush=True)
     api.upload_large_folder(

@@ -1,0 +1,23 @@
+[Unit]
+Description=Publish the pruned MiMo REAP checkpoint to the Hugging Face Hub when the run finishes
+
+[Service]
+Type=simple
+# PUBLIC on purpose. A ~100 GB checkpoint does not fit the free tier's private storage quota,
+# so a private repo would not be the cautious option -- it would be a failed upload. Remove this
+# line to publish privately instead.
+Environment=HF_PUBLIC=1
+WorkingDirectory=/home/patrickd/xiaomi-2.6-flash-REAP
+ExecStart=/bin/bash scripts/await_and_publish.sh
+Restart=on-failure
+RestartSec=10min
+# A failed upload is retried inside the script, which resumes; this only covers the watcher
+# itself being killed. Do not let it spin.
+StartLimitBurst=4
+StartLimitIntervalSec=12h
+# Never the OOM victim over the run it is waiting for.
+OOMScoreAdjust=-100
+Nice=10
+
+[Install]
+WantedBy=default.target

@@ -150,5 +150,20 @@ with tempfile.TemporaryDirectory() as td:
         check(f"card states {needle!r}", needle in card)
     check("card does not invent a public URL claim", "PUBLIC" not in card)
 
+print("\n[8] the shipped configuration says what it is going to do")
+unit = Path.home() / ".config" / "systemd" / "user" / "reap-publish.service"
+sh = (Path(__file__).parent / "await_and_publish.sh").read_text()
+check("the watcher maps HF_PUBLIC=1 to --public",
+      'HF_PUBLIC:-0}" = "1" ] && PUBLIC_FLAG="--public"' in sh)
+check("visibility is never assumed -- the log states which one happened",
+      'PUBLISHED ($vis)' in sh)
+if unit.exists():
+    u = unit.read_text()
+    check("the installed unit carries a visibility decision",
+          "HF_PUBLIC=1" in u or "HF_PUBLIC" not in u,
+          "HF_PUBLIC=1" if "HF_PUBLIC=1" in u else "absent -> private")
+else:
+    check("reap-publish.service is installed", False, str(unit))
+
 print("\nGATE " + ("FAIL: " + ", ".join(FAIL) if FAIL else "PASS"))
 sys.exit(1 if FAIL else 0)
