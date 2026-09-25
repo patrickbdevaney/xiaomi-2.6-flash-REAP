@@ -51,6 +51,11 @@ def keep_maps(pruned: dict[int, list[int]], n_exp: int) -> dict[int, dict[int, i
     return out
 
 
+# Sub-models the modelling code loads BY DIRECTORY NAME. dflash/ is deliberately absent: the
+# draft head was trained against the unpruned expert set and is not valid for this checkpoint.
+COMPANION_DIRS = ("audio_tokenizer",)
+
+
 def load_router_kd(path: Path | None):
     """{layer_index: (weight, bias, keep)} from stage 6, or None.
 
@@ -199,10 +204,18 @@ def run(src: Path, dst: Path, mask_path: Path, allow_ragged: bool = False,
                     "experts_before": n_exp, "uniform": uniform}
     (dst / "config.json").write_text(json.dumps(cfg, indent=1))
 
+    # EVERYTHING THE CHECKPOINT NEEDS TO LOAD, not just the files that happen to be flat text.
+    # The suffix list alone silently dropped chat_template.jinja (no chat formatting) and the
+    # audio_tokenizer/ directory (1.8 GB, loaded by name from modeling_mimo_v2.py, so audio
+    # input dies with it). Pruning experts is not supposed to cost a modality.
     for extra in src.glob("*"):
-        if extra.suffix in (".py", ".json", ".txt", ".model") and \
-                extra.name not in ("config.json", "model.safetensors.index.json"):
+        if extra.is_file() and extra.suffix in (".py", ".json", ".txt", ".model", ".jinja") \
+                and extra.name not in ("config.json", "model.safetensors.index.json"):
             shutil.copy2(extra, dst / extra.name)
+    for sub in COMPANION_DIRS:
+        d = src / sub
+        if d.is_dir() and not (dst / sub).exists():
+            shutil.copytree(d, dst / sub)
     return stats
 
 
