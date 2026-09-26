@@ -39,7 +39,61 @@ import router_kd as RK                                    # noqa: E402
 from calib_pass import build_layer, _modeling, masks_for, _rope  # noqa: E402
 from mimo_shards import ShardReader                       # noqa: E402
 
-CAP = {"hid": None, "valid": None, "budget": 0, "seen": 0, "gen": None}
+# Two reservoirs, and the reason is the whole fix.
+#
+# MEASURED on this run's own accumulators: only 1.13% of routed slots hit a pruned expert, and
+# only 8.71% of tokens have even one. Layers 1 and 2 are at 0.0000% -- REAP keeps the experts
+# the router selects most, so on a well-chosen mask there is almost nothing to repair. Sampling
+# 2,048 rows uniformly therefore bought ~178 rows of signal model-wide and EXACTLY ZERO on
+# layer 1, which is why its baseline loss was 7.9e-15 and why the optimiser could only walk
+# away from it. That was read as "the budget is too small". It is not. The budget is fine; it
+# was being spent on tokens where the student and teacher already agree exactly.
+#
+#   "hid"      AFFECTED rows -- teacher top-8 included a pruned expert. Where the signal is.
+#              This is what the router trains on.
+#   "hid_pop"  a uniform sample of ALL rows. This is what the accept/reject is judged on.
+#
+# Both are needed and neither is sufficient. Training on the population wastes 91% of the
+# budget on rows with zero error. Judging on the affected rows alone would happily ship a
+# router that repairs 8.7% of tokens and breaks the 91.3% that were already exact -- the
+# deployed router runs on every token, so acceptance has to be measured on every token.
+CAP = {"hid": None, "valid": None, "budget": 0, "seen": 0, "gen": None,
+       "hid_pop": None, "seen_pop": 0, "gen_pop": None,
+       "pruned": None, "gate": None, "rows": 0, "affected": 0}
+
+
+def _reservoir_pop(h: torch.Tensor) -> None:
+    """Uniform reservoir over ALL rows, for the acceptance test. Same rule as below."""
+    buf, B, n = CAP["hid_pop"], CAP["budget"], CAP["seen_pop"]
+    if buf is None or B == 0:
+        return
+    m = h.shape[0]
+    if n < B:
+        take = min(B - n, m)
+        buf[n:n + take] = h[:take]
+        CAP["seen_pop"] = n + take
+        h, n, m = h[take:], n + take, m - take
+        if m == 0:
+            return
+    idx = torch.arange(m, dtype=torch.float64)
+    keep = torch.rand(m, generator=CAP["gen_pop"], dtype=torch.float64) < B / (n + idx + 1)
+    pos = torch.nonzero(keep).flatten()
+    if pos.numel():
+        slot = torch.randint(0, B, (pos.numel(),), generator=CAP["gen_pop"])
+        buf[slot] = h[pos]
+    CAP["seen_pop"] = n + m
+
+
+def _affected_rows(h: torch.Tensor) -> torch.Tensor:
+    """Rows whose TEACHER top-8 contained a pruned expert -- the only rows carrying error.
+
+    One [rows, E] gate forward per batch, which is the same matmul the layer is about to do
+    anyway. Cheap next to the expert forward it selects for.
+    """
+    W, B, k = CAP["gate"]
+    scores = torch.sigmoid(h.float() @ W.float().T) + B.float()
+    idx = torch.topk(scores, k, dim=-1).indices
+    return CAP["pruned"].to(idx.device)[idx].any(-1)
 
 
 def _reservoir_fast(h: torch.Tensor) -> None:
@@ -277,7 +331,7 @@ def _busy() -> str | None:
 
 
 def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16,
-        tokens=2048, kept_cand=32, steps=300, lr=1e-3, batch=512, chunk_index=0, seed=0,
+        tokens=2048, kept_cand=32, steps=300, lr=1e-5, batch=512, chunk_index=0, seed=0,
         max_layers=None, max_batches=None, max_seq=None, skip_preflight=False,
         chunks_per_domain=1, batches_per_chunk=8):
     from transformers import AutoConfig
@@ -345,17 +399,35 @@ def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16
         name = f"model.layers.{li}.mlp"
         want = is_moe and li in keep_by_layer and name not in res["layers"]
 
-        CAP.update({"budget": tokens if want else 0, "seen": 0,
-                    "gen": torch.Generator().manual_seed(seed + li),
-                    "hid": torch.zeros(tokens, cfg.hidden_size, dtype=torch.float32)
-                           if want else None})
-        handle = None
+        pruned_mask = None
         if want:
-            handle = layer.mlp.register_forward_pre_hook(
-                lambda m, a: _reservoir_fast(
-                    a[0].detach().reshape(-1, a[0].shape[-1])[CAP["valid"]]
-                    if CAP["valid"] is not None
-                    else a[0].detach().reshape(-1, a[0].shape[-1])))
+            pruned_mask = torch.ones(cfg.n_routed_experts, dtype=torch.bool)
+            pruned_mask[keep_by_layer[li]] = False
+        CAP.update({"budget": tokens if want else 0, "seen": 0, "seen_pop": 0,
+                    "rows": 0, "affected": 0,
+                    "gen": torch.Generator().manual_seed(seed + li),
+                    "gen_pop": torch.Generator().manual_seed(seed + li + 100_000),
+                    "pruned": pruned_mask,
+                    "gate": (layer.mlp.gate.weight.detach(),
+                             layer.mlp.gate.e_score_correction_bias.detach(), K) if want else None,
+                    "hid": torch.zeros(tokens, cfg.hidden_size, dtype=torch.float32)
+                           if want else None,
+                    "hid_pop": torch.zeros(tokens, cfg.hidden_size, dtype=torch.float32)
+                               if want else None})
+
+        def _tap(m, a):
+            h = a[0].detach().reshape(-1, a[0].shape[-1])
+            if CAP["valid"] is not None:
+                h = h[CAP["valid"]]
+            CAP["rows"] += h.shape[0]
+            _reservoir_pop(h.float().cpu())
+            aff = _affected_rows(h)
+            CAP["affected"] += int(aff.sum())
+            h = h[aff]
+            if h.shape[0]:
+                _reservoir_fast(h)
+
+        handle = layer.mlp.register_forward_pre_hook(_tap) if want else None
         with torch.no_grad():
             for st in states:
                 CAP["valid"] = st["valid"].to(device).reshape(-1) if want else None
@@ -376,14 +448,51 @@ def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16
 
         if want:
             n = min(CAP["seen"], tokens)
-            hid = CAP["hid"][:n].to(device, dtype)
+            aff_rate = CAP["affected"] / max(CAP["rows"], 1)
             W = layer.mlp.gate.weight.detach().to(device)
             B = layer.mlp.gate.e_score_correction_bias.detach().to(device)
             keep = keep_by_layer[li].to(device)
-            cand, t_slot, t_w, kept_slot, kept_local = candidates(hid, W, B, keep, K, kept_cand)
-            cand_out = expert_outputs(layer.mlp.experts, hid, cand, dtype)
-            r = RK.fit_layer(cand_out, t_slot, t_w, hid, W, B, keep, kept_slot, kept_local, K,
-                             steps=steps, lr=lr, batch=batch, seed=seed + li)
+
+            if n == 0:
+                # Not a failure and not worth 300 gradient steps: the mask pruned nothing this
+                # layer's router ever selects, so the student's output is the teacher's output
+                # on every token and the loss is identically zero. MEASURED: layers 1 and 2 are
+                # at exactly 0.0000% affected slots. Training here can only walk away from an
+                # exact match, which is precisely what it did before.
+                r = {"w": W[keep].float().cpu(), "b": B[keep].float().cpu(),
+                     "baseline": 0.0, "first": 0.0, "last": 0.0, "boundary": 0.0,
+                     "improvement": 0.0, "kept_teacher": True, "skipped_no_signal": True}
+                print(f"  layer {li:2d} kept {len(keep)}/{cfg.n_routed_experts}  "
+                      f"0.00% of tokens affected -- nothing to repair, teacher kept  "
+                      f"[{(time.time()-t0)/60:.1f}m]", flush=True)
+            else:
+                hid = CAP["hid"][:n].to(device, dtype)
+                cand, t_slot, t_w, kept_slot, kept_local = candidates(hid, W, B, keep, K, kept_cand)
+                cand_out = expert_outputs(layer.mlp.experts, hid, cand, dtype)
+                r = RK.fit_layer(cand_out, t_slot, t_w, hid, W, B, keep, kept_slot, kept_local, K,
+                                 steps=steps, lr=lr, batch=batch, seed=seed + li)
+                r["affected_rate"] = aff_rate
+                r["train_rows"] = n
+
+                # ACCEPT ON THE POPULATION, NOT ON THE ROWS WE TRAINED. The router is trained
+                # only where there is error, but it is DEPLOYED on every token -- including the
+                # ~91% that already match the teacher exactly and can only be made worse. A
+                # judgement taken on the training rows would happily ship that trade.
+                npop = min(CAP["seen_pop"], tokens)
+                if npop:
+                    hp = CAP["hid_pop"][:npop].to(device, dtype)
+                    cp, tsp, twp, ksp, klp = candidates(hp, W, B, keep, K, kept_cand)
+                    cop = expert_outputs(layer.mlp.experts, hp, cp, dtype)
+                    base_pop = RK.baseline_loss(cop, tsp, twp, hp, W, B, keep, ksp, klp, K)
+                    with torch.no_grad():
+                        new_pop, _, _, _ = RK.teacher_student_step(
+                            cop, tsp, twp, hp, r["w"].to(device), r["b"].to(device),
+                            ksp, klp, K)
+                    r["baseline"], r["last"] = float(base_pop), float(new_pop)
+                    r["improvement"] = ((r["baseline"] - r["last"])
+                                        / max(r["baseline"], 1e-30))
+                    r["pop_rows"] = npop
+                    del cop, hp
             # NEVER SHIP A ROUTER WORSE THAN THE ONE WE STARTED FROM. The teacher's sliced router
             # is a valid, measured baseline; training is only justified where it beats it. This
             # is not hypothetical: when the mask prunes only experts the corpus never routed to,
@@ -403,19 +512,29 @@ def run(src, chunks_dir, mask_path, out_dir, device="cuda", dtype=torch.bfloat16
                                    ("baseline", "first", "last", "boundary", "improvement")}
             res["layers"][name]["tokens"] = n
             res["layers"][name]["kept_teacher"] = bool(r.get("kept_teacher", False))
-            if r.get("kept_teacher"):
+            # The number that explains every other number on this row. A layer with a low
+            # affected rate has little to repair no matter how many tokens it is shown, and
+            # reading its "improvement" without it is how the budget got blamed last time.
+            res["layers"][name]["affected_rate"] = r.get("affected_rate", 0.0)
+            res["layers"][name]["pop_rows"] = r.get("pop_rows", 0)
+            if r.get("skipped_no_signal"):
+                res["layers"][name]["skipped_no_signal"] = True
+            if r.get("kept_teacher") and "rejected_improvement" in r:
                 res["layers"][name]["rejected_improvement"] = r["rejected_improvement"]
             tmp = trained_path.with_suffix(".tmp")
             torch.save(trained, tmp); tmp.replace(trained_path)
             tmp2 = state_path.with_suffix(".tmp")
             tmp2.write_text(json.dumps(res, indent=1)); tmp2.replace(state_path)
-            print(f"  layer {li:>2} kept {len(keep):>3}/{n_exp}  loss {r['baseline']:.4e} -> "
-                  f"{r['last']:.4e} ({r['improvement']:+6.1%})  boundary {r['boundary']:.1%}  "
-                  f"n={n}{'  [kept teacher]' if r.get('kept_teacher') else ''}  "
-                  f"rss {_rss_mb()/1024:.1f}G  [{(time.time()-t0)/60:.1f}m]", flush=True)
-            del hid, cand, cand_out
+            if not r.get("skipped_no_signal"):
+                print(f"  layer {li:>2} kept {len(keep):>3}/{n_exp}  loss {r['baseline']:.4e} -> "
+                      f"{r['last']:.4e} ({r['improvement']:+6.1%})  boundary {r['boundary']:.1%}  "
+                      f"affected {r.get('affected_rate', 0):.2%}  train_n={n}  "
+                      f"pop_n={r.get('pop_rows', 0)}"
+                      f"{'  [kept teacher]' if r.get('kept_teacher') else ''}  "
+                      f"rss {_rss_mb()/1024:.1f}G  [{(time.time()-t0)/60:.1f}m]", flush=True)
+                del hid, cand, cand_out
         del layer
-        CAP["hid"] = None
+        CAP["hid"] = CAP["hid_pop"] = CAP["gate"] = CAP["pruned"] = None
         reader.release(); gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
