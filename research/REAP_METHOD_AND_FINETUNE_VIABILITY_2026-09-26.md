@@ -127,7 +127,7 @@ regardless**, because `Glm5NextTextExperts.__init__` reads a single scalar `num_
 applies it to every layer; a ragged checkpoint is unloadable by vLLM and the GGUF converters. The
 lever is closed on both models for different reasons. Good: that is one fewer thing to build.
 
-**Our router KD is a no-op, and we should stop reporting it as a stage that did something.**
+**Our router KD is a no-op — and the reason is not the one this document first gave.**
 `artifacts/masks/router_kd_state.json`, MiMo:
 
 ```
@@ -135,14 +135,47 @@ layers 47; kept_teacher (KD update REJECTED) 47; layers improved 0
 median improvement 0.000000; max 0.000000
 ```
 
-The guard rejected its own update on every single layer and kept the teacher router. The likely
-cause is visible in the same file: **2,048 tokens per layer.** arXiv 2603.02217 trains the router
-for ~2 GPU-hours on Qwen3-30B. We gave it a rounding error's worth of data, the update failed to
-beat the teacher, and the guard correctly refused it. So the stage is honest — it did not ship a
-worse router — but it bought nothing, and the literature says it should be worth real points on
-fine-grained MoE. **GLM pass 2 never ran it at all** (`grep -c router_kd logs/pipeline.log` → 0).
+The first version of this section blamed the 2,048-token-per-layer budget. **That was wrong and
+is corrected here (2026-09-26, measured).** Two findings, in order.
 
-This is now the cheapest unclaimed gain we have: more tokens, same code.
+*There is very little to repair.* From this run's own accumulators against its own mask:
+**1.13% of routed slots hit a pruned expert, and 8.71% of tokens have even one.** Layers 1 and
+2 are at exactly **0.0000%**. REAP keeps the experts the router selects most, so on a
+well-chosen mask the student already equals the teacher on ~91% of tokens — which is why layer
+1's baseline loss was 7.9e-15. Not starvation; near-exactness. Layer 7 is the outlier at 18.18%
+of slots (79.9% of tokens) and carries the run's largest baseline loss.
+
+*And raising the signal does not rescue it.* On a fixture carrying the checkpoint's measured
+router scale (weight RMS 0.032) and bias spread (layer 7: mean +1.383, **std 0.059** — nearly
+constant, so selection is driven by the trainable weight, not the bias), **no combination of
+sampling rule, token budget or step size beats the teacher's sliced router on a held-out
+population**:
+
+| step | held-out population |
+|---|---|
+| lr 1e-3 (shipped) | **−299%** |
+| lr 1e-4 | −62% |
+| lr 1e-5 | −7.5% |
+| lr 3e-6 | −2.2% |
+
+Damage falls monotonically as the step approaches *change nothing*, and the winner is whichever
+configuration does least. Adam's update is scale-free, so 300 steps at 1e-3 walk each entry up
+to 0.3 — ten times the whole weight.
+
+**So the 47/47 rejections were correct and the stage is honest about being out of work.** The
+"cheapest unclaimed gain" claim is withdrawn. What remains untried is the *published* objective:
+arXiv 2603.02217 distils the router against the full model's next-token distribution, globally.
+Ours is layer-local output matching, and the GLM docstring already concedes it — "local matching
+cannot see how errors compose across layers, so it is an approximation, not the published
+method." If router repair is worth anything here it is worth it globally, and that is a
+different build.
+
+Caveat: the fixture is realistic in router scale, bias spread and prune structure, but its
+experts are an elementwise map of the hidden state. Real expert functions may leave the
+teacher's router less close to optimal than this fixture does.
+
+**GLM pass 2 never ran router KD at all** (`grep -c router_kd logs/pipeline.log` → 0), so none
+of this has been tested on that model. Pass 3 records `affected_rate` per layer either way.
 
 ---
 
@@ -287,8 +320,9 @@ rests on the literature's priors, not on our evidence.
 1. **Finish pass 3 and read the neutral ruler.** GLM has a cached teacher (`teacher.pt`, 338,113
    tokens) and a paired harness. This is the first end-to-end number we will have for any mask we
    have ever shipped. Everything below is speculation until it lands.
-2. **Give router KD real data.** 2,048 tokens per layer produced 47/47 rejections. The code works
-   and the guard is honest; it has simply never been fed. Cheapest unclaimed gain we have.
+2. ~~Give router KD real data.~~ **WITHDRAWN 2026-09-26.** Measured: the budget was not the
+   cause, and no budget or step size beats the teacher's sliced router under our layer-local
+   objective. See the corrected section 4. The published global objective remains untried.
 3. **Build MiMo a neutral evaluation.** It shipped with no teacher-student measurement at all.
    Without one we cannot say whether HOPE or REAP-(0,1,1) was the right call on that model, and
    §2 says the retention number cannot answer it.
