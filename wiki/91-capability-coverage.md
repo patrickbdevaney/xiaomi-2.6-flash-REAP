@@ -35,25 +35,29 @@ MiMo calibrated at **4096 tokens** — MEASURED, not inferred from the default:
 `artifacts/chunks/` are uniformly 4,096 wide (mean 3,808 valid tokens, max 4,096, min 209).
 That is twice GLM's 2,048.
 
-**But it buys less than it looks like it buys**, for two reasons visible in
-`scripts/build_corpus.py:582`:
+**How much of that 4,096 is coherent context?** `build_corpus.py:582` truncates every document
+at `seq_len - 1 = 4095`, and `Packer.add()` appends an EOS after each document and keeps filling
+the row — so a row *can* hold several unrelated spans. MEASURED 2026-09-26 over 3,088 rows from
+6 chunks, counting EOS (id 151645, which terminates 100 % of rows):
 
-```python
-ids = tok(t, add_special_tokens=False, truncation=True, max_length=seq_len - 1)
-...
-if len(ids) + 1 > P.room():
-    emit(force=True)
-P.add(ids)
-```
+| | |
+|---|---|
+| documents per row | mean **1.74**, median **1**, max 9 |
+| rows holding ≥2 documents | 26.2 % |
+| longest single document per row | mean 3,217, **median 4,095** |
+| rows whose longest document >2,048 | **75.8 %** |
+| rows whose longest document >4,000 | **61.9 %** |
 
-1. **Every document is truncated at 4,095 tokens.** No sample in MiMo's calibration set carries
-   coherent structure longer than that, against a model served at long context.
-2. **Rows are packed, not single documents.** The packer concatenates several documents to fill a
-   4,096 row, so a row's 4,096 tokens are frequently *unrelated* spans. The long-range structure
-   inside a row is often an artifact of packing rather than real dependency.
+> **Correcting an earlier claim on this page.** It said a 4,096 row is "frequently unrelated
+> spans". That is **falsified by the measurement above**: 73.8 % of rows are a *single* document,
+> the median row's longest document is 4,095 — the truncation ceiling — and 61.9 % of rows carry
+> a coherent span over 4,000 tokens. Packing dilution is a minority effect, not the dominant one.
+> `~~superseded~~ → this entry.` `[EST]`
 
-So the honest statement is that MiMo's saliency was measured over **≤4,095-token documents,
-frequently shorter**, and never above that. `[EST]`
+So MiMo's saliency **did** genuinely exercise coherent ~4K contexts for most of its calibration,
+which is real long-ish context and twice what GLM got. The binding limit is not packing — it is
+the **hard ceiling at 4,095**, which the majority of rows sit exactly against. Nothing above 4 K
+was ever seen, against a model served far beyond it. `[EST]`
 
 The structural argument also runs in MiMo's favour, and it is the reason
 `scripts/exp_seqlen_saliency.py` was written:
@@ -111,10 +115,11 @@ slice in the *eval*, which costs no calibration budget.
 ## 5. Standing answer
 
 > Multimodal (image, audio, video): **yes — 6.0 M routed tokens, protected and measured.**
-> Long context: **factored in only as far as 4,096 tokens — documents truncated at 4,095 and
-> then packed, so no long-range dependency was ever measured. 39/48 SWA-128 layers make the
-> exposure structurally small, but that is an argument, not a result: the test written to
-> confirm it never ran.**
+> Long context: **considered properly up to 4,095 tokens and not one token further.** 61.9 % of
+> rows carry a coherent span over 4,000, so the 4 K window was really exercised — but it is a
+> hard ceiling, and the model serves far beyond it. 39/48 SWA-128 layers make the exposure
+> structurally small, but that is an argument, not a result: the test written to confirm it
+> never ran.
 > Non-English: **untested here; 0.3 % on the sibling corpus.**
 > Everything else named: covered.
 
