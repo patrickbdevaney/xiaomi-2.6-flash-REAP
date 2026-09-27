@@ -26,6 +26,7 @@ cross-referenced between the two REAPs.
 |---|---|
 | [00-log.md](00-log.md) | Chronological append-only log of every session, finding, and experiment |
 | [91-capability-coverage.md](91-capability-coverage.md) | What calibration protects: long-context and non-English gaps |
+| [92-long-context-program.md](92-long-context-program.md) | Holding the REAP at native 1M: arithmetic, SWA structure, NIAH/LongPPL plan |
 | [98-router-kd-global.md](98-router-kd-global.md) | Router KD: the local objective's negative result, and the global scope |
 
 Longer method write-ups live in [`../research/`](../research/); this wiki is the index of
