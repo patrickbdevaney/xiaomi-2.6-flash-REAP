@@ -138,3 +138,45 @@ All three run against the paired teacher/student protocol already in `s09_eval`.
 
 LongPPL and the agentic suite follow; they are the more expensive rulers and the ladder result
 determines how much they need to cover.
+
+---
+
+## 7. "Retrieve" and "use" are not the same risk  `[EXT]`
+
+The requirement names *"niah, longppl and multi hop long horizon agentic"*. Those split cleanly
+along what REAP actually modifies, and the split is worth stating because it is easy to read the
+§1–2 architecture argument as covering both. It does not.
+
+**REAP prunes experts. It does not touch attention.** No KDA parameter, no DSA parameter, no KV
+projection, no cache layout changes. The machinery that *locates* a needle at position 700,000 is
+bit-identical to the unpruned model's.
+
+- **Retrieval (NIAH) is structurally the safer half.** It is mostly an attention property, and
+  attention is untouched. Expect it to hold, and treat a NIAH pass as confirming the cheap half.
+- **Use — reasoning over what was retrieved — is where the risk actually lives.** That is expert
+  work, and half the experts are gone.
+
+So a clean NIAH result would be genuine but **weak** evidence: it is the outcome most protected by
+what REAP leaves alone. LongPPL and multi-hop agentic are the informative rulers.
+
+### The failure mode the architecture argument does not cover
+
+§2 argues that 39/48 SWA-128 layers are S-invariant by construction, so a mask calibrated short
+is probably the *right mask* for long context on those layers.
+Grant that entirely. It still leaves untouched:
+
+> A per-token quality loss too small to see at 500 tokens can be decisive across 100,000 tokens
+> of multi-hop reasoning, because errors compose.
+
+"Right mask" and "enough capacity" are different claims. This is the same error-composition
+argument that makes the layer-local KD objective an approximation
+([98-router-kd-global.md](98-router-kd-global.md) §2) — local adequacy does not imply global
+adequacy, and nothing measured so far speaks to the global case.
+
+### Where architecture is a risk, not a reassurance
+
+On MiMo, 39 of 48 layers are SWA-128 and **cannot integrate long-range information at all**. All
+long-range integration is concentrated in **9 layers**. Bounded state does not dilute the risk
+there — it concentrates it. Pruning experts in those 9 layers is disproportionately consequential,
+and the layer-7 affected rate of 18.18 % of slots is a reason to look there first, not a reason to
+relax. `[OPEN]`
