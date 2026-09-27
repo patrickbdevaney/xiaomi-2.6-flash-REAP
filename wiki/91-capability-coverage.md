@@ -28,12 +28,32 @@ reserves the top-k of every domain separately so no modality can be zeroed by a 
 
 ---
 
-## 2. Long context: better than GLM, still unverified  `[EST]`
+## 2. Long context: 4,096-token windows, truncated and packed, never tested  `[EST]`
 
-MiMo calibrated at **`SEQ_LEN` default 4096** (`scripts/run_reap.sh:13`), twice GLM's 2,048.
-The corpus spec allows up to `MAX_TOKENS = 16_384` with `BAND_HARD = (4_000, 16_384)`, so the
-hard band is *partially* represented rather than erased — a 4,096-token window admits the bottom
-of the hard band intact.
+MiMo calibrated at **4096 tokens** — MEASURED, not inferred from the default:
+`grep 'seq_len' logs/*.log` returns `seq_len 4096` on all 11 occurrences, and the packed rows in
+`artifacts/chunks/` are uniformly 4,096 wide (mean 3,808 valid tokens, max 4,096, min 209).
+That is twice GLM's 2,048.
+
+**But it buys less than it looks like it buys**, for two reasons visible in
+`scripts/build_corpus.py:582`:
+
+```python
+ids = tok(t, add_special_tokens=False, truncation=True, max_length=seq_len - 1)
+...
+if len(ids) + 1 > P.room():
+    emit(force=True)
+P.add(ids)
+```
+
+1. **Every document is truncated at 4,095 tokens.** No sample in MiMo's calibration set carries
+   coherent structure longer than that, against a model served at long context.
+2. **Rows are packed, not single documents.** The packer concatenates several documents to fill a
+   4,096 row, so a row's 4,096 tokens are frequently *unrelated* spans. The long-range structure
+   inside a row is often an artifact of packing rather than real dependency.
+
+So the honest statement is that MiMo's saliency was measured over **≤4,095-token documents,
+frequently shorter**, and never above that. `[EST]`
 
 The structural argument also runs in MiMo's favour, and it is the reason
 `scripts/exp_seqlen_saliency.py` was written:
@@ -91,8 +111,10 @@ slice in the *eval*, which costs no calibration budget.
 ## 5. Standing answer
 
 > Multimodal (image, audio, video): **yes — 6.0 M routed tokens, protected and measured.**
-> Long context: **calibrated at 4,096 with 39/48 layers structurally S-invariant, so exposure is
-> low — but the test that would confirm it was written and never run.**
+> Long context: **factored in only as far as 4,096 tokens — documents truncated at 4,095 and
+> then packed, so no long-range dependency was ever measured. 39/48 SWA-128 layers make the
+> exposure structurally small, but that is an argument, not a result: the test written to
+> confirm it never ran.**
 > Non-English: **untested here; 0.3 % on the sibling corpus.**
 > Everything else named: covered.
 
