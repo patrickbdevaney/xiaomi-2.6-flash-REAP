@@ -44,9 +44,12 @@ Not stock REAP. See [`research/REAP_METHODOLOGY_SOTA_2026-09-23.md`](research/RE
 3. **Decomposed evaluation only.** At high sparsity, calibration strategies span 2.85 points of
    *averaged* accuracy but **51.9 points of code retention** (arXiv 2606.03328). An averaged
    number here is not a weak signal, it is a misleading one.
-4. **Searched per-layer budgets**, not uniform (EvoESAP): +15.2% Math Avg at 50%.
-5. **Router KD is required**, not optional (arXiv 2603.02217) — post-compression damage is
+4. **Searched per-layer budgets**, not uniform (EvoESAP): +15.2% Math Avg at 50%. *Planned, not yet
+   applied: the published checkpoint uses a uniform 50% ratio.*
+5. **Router KD was planned as required** (arXiv 2603.02217) — post-compression damage is
    largely router-expert mismatch, worst on fine-grained MoEs, and at 256 experts this is one.
+   *Result: the router refit did not beat the untouched teacher routers on this checkpoint, so all
+   47 were kept at teacher weights (a negative result, logged in the wiki).*
 
 ## The omni hole this exists to avoid
 
@@ -101,7 +104,12 @@ F-matrix silently deflated every entry under a valid-mask until `F[k,k] == sq/cn
 - [x] Audio and video loaders, gated end-to-end on the real towers and the shipped RVQ tokenizer
 - [x] Ballast share decided: **0.15 → 0.20**, out of science (0.10→0.07) and finance (0.06→0.04)
 - [x] Corpus wired into the chunk builder; full chain smoked (9 buckets → chunks → pass)
-- [ ] Calibration pass → HOPE QP → per-layer budget search → Router KD
+- [x] Calibration pass → HOPE QP → 50% prune, published as
+      [MiMo-V2.6-Flash-REAP50](https://huggingface.co/patrickbdevaney/MiMo-V2.6-Flash-REAP50) (2026-09-25),
+      with [GGUF builds](https://huggingface.co/patrickbdevaney/MiMo-V2.6-Flash-REAP50-GGUF)
+- [x] Router KD attempted: refit did not beat the teacher routers, all 47 kept (negative result)
+- [ ] Per-layer budget search (the published checkpoint is uniform 50%)
+- [ ] End-to-end quality evaluation (only saliency retention is published so far: worst domain 0.9935, mean 0.9964)
 - [ ] CUDA server (48 layers, 9 full + 39 SWA, GQA with per-type KV head counts, no shared expert)
 
 Base model: `XiaomiMiMo/MiMo-V2.6-Flash-RL` (MIT). Method: REAP (arXiv 2510.13999), HOPE
