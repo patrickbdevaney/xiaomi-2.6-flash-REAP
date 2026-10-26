@@ -153,7 +153,7 @@ Not included: weights, calibration corpora, pass outputs. These are published on
 
 ## License
 
-- **Pipeline code:** no license has been granted yet. One is pending.
+- **Pipeline code:** MIT ([`LICENSE`](LICENSE)).
 - **Weights:** MIT, inherited from
   [`XiaomiMiMo/MiMo-V2.6-Flash-RL`](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL). This work is not
   affiliated with or endorsed by Xiaomi.
